@@ -81,6 +81,66 @@ under churn. A medium-churn condense test measured `0.529` acceptance and
 The checkpoint note is in
 [`benchmarks/20260629-dspark-keys-concurrency-checkpoint.md`](benchmarks/20260629-dspark-keys-concurrency-checkpoint.md).
 
+### Full-1M Concurrency Profile (production: 1M / max_num_seqs=6)
+
+The 200K/16 profile above maximizes raw concurrency. For agent fleets that want
+the **full 1M context ceiling AND concurrency**, run `max_model_len=1048576`
+with `max_num_seqs=6`. Every request can still grow to 1M while up to 6 sessions
+run at once, because the shared KV pool — not a per-slot reservation — is the
+real limit (see [How the KV cache works](#how-the-kv-cache-works-why-1m--concurrency-is-safe)).
+
+Validated on this deployment (NVFP4, `max_model_len=1048576`, `max_num_seqs=6`,
+`VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`, `VLLM_USE_B12X_WO_PROJECTION=1`):
+
+- Boot: `GPU KV cache size: 1,901,239 tokens`, `Maximum concurrency for 1,048,576 tokens per request: 1.81x`
+- 6 concurrent requests: **6/6 success**, **~182 tok/s aggregate** (~30 tok/s per stream), no OOM / no preemption failures
+- Single-stream decode on this same profile: ~67 tok/s (code)
+
+This is the right profile when most sessions sit far below 1M (typical agent
+turns) but you still want the 1M ceiling available — ~2.7x the single-stream
+throughput across the fleet without giving up context.
+
+> Higher concurrency is not free: under sustained pressure you can see added
+> scheduler churn, prefill contention, and KV fragmentation. 1M/6 is validated
+> for normal-length agent traffic; for guaranteed deep-context work under load,
+> 1M/2 is conservative and 500K/4 is a balanced middle.
+
+## How the KV cache works (why 1M + concurrency is safe)
+
+Three independent knobs, often confused:
+
+| knob | what it is | this build |
+| --- | --- | --- |
+| **KV cache pool** | total shared KV memory in tokens, sized from `gpu_memory_utilization` after weights load | ~1.9–2.04M tokens (NVFP4) |
+| `max_model_len` | per-request **ceiling** — how long any one request may grow | 1,048,576 (1M) |
+| `max_num_seqs` | **concurrency cap** — max active sequences the scheduler runs at once | 6 |
+
+The pool is **shared and allocated on demand**: PagedAttention hands KV blocks
+to each request as it generates tokens and frees them when it finishes.
+`max_model_len` and `max_num_seqs` are **ceilings, not reservations** — vLLM does
+NOT pre-allocate `max_num_seqs × max_model_len` of KV. So the real constraint is:
+
+```
+sum(live tokens across all active requests) <= KV pool (~1.9M)
+```
+
+Worked examples at 1M ceiling / 6 slots:
+
+```
+6 requests x  50k tokens =  300k   fits easily
+6 requests x 200k tokens =  1.2M   fits
+6 requests x 317k tokens =  1.9M   ~at the limit
+2 requests x 1M   tokens =  2.0M   ~at the limit  (this is the "1.81x" boot number)
+6 requests x 1M   tokens =  6.0M   impossible — excess requests queue/preempt
+```
+
+The boot log's `Maximum concurrency for 1,048,576 tokens per request: 1.81x`
+only means ~1.8 *simultaneous full-1M* requests fit. But agent turns are almost
+never near 1M, so 6 normal-length sessions share the pool comfortably while the
+1M ceiling stays available for the rare long one. That is exactly why
+`1M + max_num_seqs=6` is safe: you are not reserving 6×1M, you are sharing one
+~1.9M pool across short requests under a high ceiling.
+
 ## Important Caveat
 
 This is the **Stage C padded NVFP4** path. It keeps DeepSeek V4's known-good
