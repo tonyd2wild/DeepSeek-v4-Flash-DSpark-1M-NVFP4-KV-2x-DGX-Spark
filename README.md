@@ -64,6 +64,9 @@ This recipe stands on prior public work:
   and [fraserprice/dspark-vllm](https://github.com/fraserprice/dspark-vllm)
 - MiaAI-Lab's two-node DGX Spark packaging and worker-first launch runbook:
   [MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark)
+- **drowzeys ("Keys")** — origin of wiring the `nvfp4_ds_mla` KV-cache dtype into a DGX Spark launch recipe
+  ([Keys---Full-GLM-5.2-Quantrio…](https://github.com/drowzeys/Keys---Full-GLM-5.2-Quantrio-INT4-INT8-mixed-8bit-Attention-on-4-x-DGX-Spark-GB10-Cluster)).
+  This build's 1M NVFP4 KV path descends from that `nvfp4_ds_mla` work.
 - Upstream vLLM, FlashInfer, NVIDIA Blackwell/CUDA/NCCL tooling, and
   DeepSeek V4 Flash.
 - DeepSeek-AI's DeepSpec work as the public DSpark/speculative decoding
