@@ -285,12 +285,76 @@ class DeepSeekV4DSparkAttention(nn.Module):
         kv = kv.squeeze(1)
         return self._maybe_quant_dequant_kv(kv)
 
+    def _store_main_kv_ragged(
+        self,
+        main_x: torch.Tensor,
+        main_positions: torch.Tensor,
+        query_start_loc: list[int],
+        num_rejected_tokens: torch.Tensor | None,
+        slot_index: list[int] | torch.Tensor | None,
+    ) -> None:
+        """Scatter ragged (mixed prefill+decode) per-request rows.
+
+        ``main_x`` is flat [total_rows, hidden_size] and ``main_positions`` is
+        flat [total_rows]; ``query_start_loc`` gives per-request offsets. Each
+        request's rows are scattered into ITS slot's ring buffer using absolute
+        positions (``positions % window``), so no rectangular view / uniform
+        length is required. Runs eager (mixed steps are never cudagraphed).
+        """
+        flat_positions = main_positions.reshape(-1)
+        flat_kv = self._project_kv(main_x, flat_positions)
+        batch_size = len(query_start_loc) - 1
+        rejected = None
+        if num_rejected_tokens is not None:
+            rejected = num_rejected_tokens.to(
+                device=main_x.device,
+                dtype=torch.long,
+                non_blocking=True,
+            ).view(batch_size)
+        for i in range(batch_size):
+            start = int(query_start_loc[i])
+            end = int(query_start_loc[i + 1])
+            seg_kv = flat_kv[start:end]
+            seg_positions = flat_positions[start:end].to(torch.long)
+            if seg_kv.shape[0] > self.window_size:
+                seg_kv = seg_kv[-self.window_size :]
+                seg_positions = seg_positions[-self.window_size :]
+            seg_len = seg_kv.shape[0]
+            if seg_len == 0:
+                continue
+            slots = seg_positions.remainder(self.window_size)
+            row = i if slot_index is None else int(slot_index[i])
+            cache_row = self.main_kv_cache[row]
+            values = seg_kv
+            if rejected is not None:
+                valid_len = (seg_len - rejected[i]).clamp(min=1, max=seg_len)
+                token_offsets = torch.arange(
+                    seg_len,
+                    device=seg_kv.device,
+                    dtype=torch.long,
+                )
+                valid_mask = (token_offsets < valid_len).unsqueeze(-1)
+                old_values = cache_row.index_select(0, slots)
+                values = torch.where(valid_mask, seg_kv, old_values)
+            cache_row.index_copy_(0, slots, values)
+
     def store_main_kv(
         self,
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
+        slot_index: torch.Tensor | None = None,
+        query_start_loc: list[int] | None = None,
     ) -> None:
+        if query_start_loc is not None:
+            self._store_main_kv_ragged(
+                main_x,
+                main_positions,
+                query_start_loc,
+                num_rejected_tokens,
+                slot_index,
+            )
+            return
         if main_x.shape[1] > self.window_size:
             main_x = main_x[:, -self.window_size :]
             main_positions = main_positions[:, -self.window_size :]
@@ -300,7 +364,17 @@ class DeepSeekV4DSparkAttention(nn.Module):
             main_positions.reshape(batch_size * seq_len),
         ).view(batch_size, seq_len, self.head_dim)
         slots = main_positions.to(torch.long).remainder(self.window_size)
+        slots_index = slots.unsqueeze(-1).expand(-1, -1, self.head_dim)
         values = flat_kv
+        # ``slot_index is None`` keeps the original single-stream behaviour:
+        # operate in place on the leading ``batch_size`` rows (byte-for-byte
+        # identical). Otherwise gather the per-request slot rows, update them,
+        # and scatter them back, so the stateful sliding-window KV follows the
+        # request id rather than the (condensable) batch-row position.
+        if slot_index is None:
+            cache_rows = self.main_kv_cache[:batch_size]
+        else:
+            cache_rows = self.main_kv_cache.index_select(0, slot_index)
         if num_rejected_tokens is not None:
             rejected = num_rejected_tokens.to(
                 device=main_x.device,
@@ -314,16 +388,11 @@ class DeepSeekV4DSparkAttention(nn.Module):
                 dtype=torch.long,
             ).view(1, seq_len)
             valid_mask = token_offsets < valid_lengths.view(batch_size, 1)
-            old_values = self.main_kv_cache[:batch_size].gather(
-                1,
-                slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
-            )
+            old_values = cache_rows.gather(1, slots_index)
             values = torch.where(valid_mask.unsqueeze(-1), flat_kv, old_values)
-        self.main_kv_cache[:batch_size].scatter_(
-            1,
-            slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
-            values,
-        )
+        cache_rows.scatter_(1, slots_index, values)
+        if slot_index is not None:
+            self.main_kv_cache.index_copy_(0, slot_index, cache_rows)
 
     def _project_q_and_draft_kv(
         self,
@@ -351,9 +420,10 @@ class DeepSeekV4DSparkAttention(nn.Module):
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if store_main_kv:
-            self.store_main_kv(main_x, main_positions)
+            self.store_main_kv(main_x, main_positions, slot_index=slot_index)
 
         q, draft_kv = self._project_q_and_draft_kv(hidden_states, positions)
         q = q.view(batch_size, block_size, self.n_local_heads, self.head_dim)
@@ -364,10 +434,19 @@ class DeepSeekV4DSparkAttention(nn.Module):
             torch.full_like(current_positions, self.window_size),
         )
 
+        # The kernel indexes contiguous batch rows 0..B-1. ``slot_index is
+        # None`` passes the full persistent cache (rows 0..B-1 == identity);
+        # otherwise gather the per-request slot rows into a contiguous
+        # [B, window, head_dim] view in the same order as ``valid_main_lengths``.
+        if slot_index is None:
+            main_kv_cache = self.main_kv_cache
+        else:
+            main_kv_cache = self.main_kv_cache.index_select(0, slot_index)
+
         out = dspark_sparse_attention(
             q,
             draft_kv,
-            self.main_kv_cache,
+            main_kv_cache,
             valid_main_lengths,
             self.attn_sink,
             self.softmax_scale,
@@ -609,6 +688,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = x
         attn_in, post, comb = unpack_mhc_pre_outputs(
@@ -625,6 +705,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
             main_x=main_x,
             main_positions=main_positions,
             store_main_kv=store_main_kv,
+            slot_index=slot_index,
         )
         x = self.hc_post(attn_out.to(self.dtype), residual, post, comb).to(self.dtype)
 
@@ -706,14 +787,21 @@ class DeepSeekV4DSparkModel(nn.Module):
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
+        slot_index: torch.Tensor | None = None,
+        query_start_loc: list[int] | None = None,
     ) -> None:
         main_x = self.project_main(main_hidden.reshape(-1, main_hidden.shape[-1]))
-        main_x = main_x.view(*main_hidden.shape[:-1], self.config.hidden_size)
+        if query_start_loc is None:
+            # Rectangular [B, seq, hidden_size] fast-path (uniform / static).
+            main_x = main_x.view(*main_hidden.shape[:-1], self.config.hidden_size)
+        # else: keep flat [total_rows, hidden_size] for the ragged path.
         for layer in self.layers.values():
             layer.attn.store_main_kv(
                 main_x,
                 main_positions,
                 num_rejected_tokens=num_rejected_tokens,
+                slot_index=slot_index,
+                query_start_loc=query_start_loc,
             )
 
     def draft(
@@ -727,6 +815,7 @@ class DeepSeekV4DSparkModel(nn.Module):
         return_logits: bool = True,
         return_confidence: bool = True,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = input_ids.shape[0]
         block_size = self.block_size
@@ -765,6 +854,7 @@ class DeepSeekV4DSparkModel(nn.Module):
                 main_x=main_x,
                 main_positions=main_positions,
                 store_main_kv=store_main_kv,
+                slot_index=slot_index,
             )
 
         final_layer = self.layers[self.stage_layer_keys[-1]]
@@ -873,11 +963,15 @@ class DeepSeekV4DSpark(nn.Module):
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
+        slot_index: torch.Tensor | None = None,
+        query_start_loc: list[int] | None = None,
     ) -> None:
         self.model.prefill_main(
             main_hidden,
             main_positions,
             num_rejected_tokens=num_rejected_tokens,
+            slot_index=slot_index,
+            query_start_loc=query_start_loc,
         )
 
     def draft(
@@ -887,6 +981,7 @@ class DeepSeekV4DSpark(nn.Module):
         main_positions: torch.Tensor,
         *,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         draft_ids, _logits, confidence = self.model.draft(
             input_ids,
@@ -895,6 +990,7 @@ class DeepSeekV4DSpark(nn.Module):
             self.lm_head,
             self.logits_processor,
             store_main_kv=store_main_kv,
+            slot_index=slot_index,
         )
         self._last_confidence = confidence
         return draft_ids
@@ -908,6 +1004,7 @@ class DeepSeekV4DSpark(nn.Module):
         return_logits: bool = True,
         return_confidence: bool = True,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         draft_ids, logits, confidence = self.model.draft(
             input_ids,
@@ -918,6 +1015,7 @@ class DeepSeekV4DSpark(nn.Module):
             return_logits=return_logits,
             return_confidence=return_confidence,
             store_main_kv=store_main_kv,
+            slot_index=slot_index,
         )
         return draft_ids, logits, confidence
 

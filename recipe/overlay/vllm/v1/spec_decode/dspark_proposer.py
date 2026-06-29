@@ -76,6 +76,19 @@ class DSparkProposer(SpecDecodeBaseProposer):
             dtype=torch.long,
             device=device,
         )
+        # Persistent, cudagraph-captured slot index for the draft read path.
+        # Filled before every replay; defaults to identity so warmup/capture
+        # and the single-stream path stay byte-for-byte unchanged.
+        self._draft_slot_index_buffer = torch.arange(
+            self.max_batch_size,
+            dtype=torch.long,
+            device=device,
+        )
+        # Stable per-request -> persistent-KV-slot map. The draft model's only
+        # cross-step state (main_kv_cache) must follow the request id, not the
+        # batch-row position, which vLLM-v1 condenses as requests finish.
+        self._req_id_to_slot: dict[str, int] = {}
+        self._free_slots: list[int] = list(range(self.max_batch_size))
         self.diagnostics = DSparkDiagnostics(
             max_spec_tokens=self.num_speculative_tokens
         )
@@ -465,17 +478,29 @@ class DSparkProposer(SpecDecodeBaseProposer):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         padded_batch_size: int,
+        slot_index: torch.Tensor | None = None,
     ) -> None:
         batch_size = input_ids.shape[0]
         self._draft_graph_batch_size = padded_batch_size
         self._draft_input_ids_buffer[:batch_size].copy_(input_ids.to(torch.long))
         self._draft_hidden_buffer[:batch_size].copy_(hidden_states.to(self.dtype))
         self._draft_positions_buffer[:batch_size].copy_(positions.to(torch.long))
+        if slot_index is None:
+            self._draft_slot_index_buffer[:batch_size].copy_(
+                torch.arange(batch_size, device=self.device, dtype=torch.long)
+            )
+        else:
+            self._draft_slot_index_buffer[:batch_size].copy_(
+                slot_index.to(torch.long)
+            )
         if padded_batch_size > batch_size:
             pad_slice = slice(batch_size, padded_batch_size)
             self._draft_input_ids_buffer[pad_slice].fill_(self.noise_token_id)
             self._draft_hidden_buffer[pad_slice].zero_()
             self._draft_positions_buffer[pad_slice].zero_()
+            # Padding rows only ever gather (read) the persistent cache, so any
+            # valid in-range slot is safe; 0 keeps the captured indices in range.
+            self._draft_slot_index_buffer[pad_slice].zero_()
 
     def _run_draft_from_buffers(
         self,
@@ -488,6 +513,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
             return_logits=self._needs_draft_logits(),
             return_confidence=self._needs_confidence(),
             store_main_kv=False,
+            slot_index=self._draft_slot_index_buffer[:batch_size],
         )
 
     def _run_draft_for_current_context(
@@ -499,6 +525,28 @@ class DSparkProposer(SpecDecodeBaseProposer):
 
     def _batch_size(self, next_token_ids: torch.Tensor) -> int:
         return int(next_token_ids.shape[0])
+
+    def _row_to_slot(self, req_ids: list[str]) -> list[int]:
+        """Map current batch rows to stable persistent-KV slots.
+
+        Reclaims slots whose requests are no longer live, assigns a free slot
+        to any newly seen request, and returns the slot for each request in the
+        SAME ORDER as ``req_ids`` (i.e. batch-row order). Free slots are reused
+        lowest-first so a server that only ever runs one request at a time keeps
+        slot 0 -> the single-stream path stays the identity permutation.
+        """
+        live = set(req_ids)
+        for stale in [r for r in self._req_id_to_slot if r not in live]:
+            self._free_slots.append(self._req_id_to_slot.pop(stale))
+        self._free_slots.sort()
+        slots: list[int] = []
+        for req_id in req_ids:
+            slot = self._req_id_to_slot.get(req_id)
+            if slot is None:
+                slot = self._free_slots.pop(0)
+                self._req_id_to_slot[req_id] = slot
+            slots.append(slot)
+        return slots
 
     def _view_by_request(
         self,
@@ -724,6 +772,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
+        req_ids: list[str] | None = None,
     ) -> torch.Tensor:
         del (
             target_token_ids,
@@ -736,14 +785,49 @@ class DSparkProposer(SpecDecodeBaseProposer):
         total_started = time.perf_counter()
         batch_size = self._batch_size(next_token_ids)
 
+        # Resolve the stable per-request KV slot for this step. The map is
+        # always advanced (reclaim/assign) so it stays consistent across steps,
+        # but when the resulting permutation is the identity we pass
+        # ``slot_index=None`` downstream so the single-stream / non-condensed
+        # path stays byte-for-byte the original in-place behaviour.
+        slot_list: list[int] | None = None
+        slot_index: torch.Tensor | None = None
+        buffer_slot_index: torch.Tensor | None = None
+        if req_ids is not None and len(req_ids) == batch_size:
+            slot_list = self._row_to_slot(req_ids)
+            if slot_list != list(range(batch_size)):
+                slot_index = torch.tensor(
+                    slot_list, device=self.device, dtype=torch.long
+                )
+                buffer_slot_index = slot_index
+
         def prepare_context():
             nonlocal target_hidden_states, target_positions
             rejected_for_gpu_mask = None
+            prefill_query_start_loc: list[int] | None = None
+            ragged = False
+            query_starts: list[int] | None = None
             if (
                 getattr(self, "_gpu_rejected_context_mask", False)
                 and num_rejected_tokens_gpu is not None
             ):
                 rejected_for_gpu_mask = num_rejected_tokens_gpu
+                # Detect non-uniform per-request query rows (mixed prefill +
+                # decode under chunked prefill). Only then do we need the ragged
+                # path; uniform/static batches keep the rectangular fast-path.
+                if common_attn_metadata is not None:
+                    qsl_cpu = common_attn_metadata.query_start_loc_cpu
+                    if qsl_cpu is None:
+                        qsl_cpu = (
+                            common_attn_metadata.query_start_loc.detach().cpu()
+                        )
+                    query_starts = qsl_cpu.tolist()
+                    if len(query_starts) == batch_size + 1:
+                        seg_lengths = [
+                            query_starts[i + 1] - query_starts[i]
+                            for i in range(batch_size)
+                        ]
+                        ragged = len(set(seg_lengths)) != 1
             else:
                 target_hidden_states, target_positions = (
                     self._trim_rejected_target_context(
@@ -753,6 +837,49 @@ class DSparkProposer(SpecDecodeBaseProposer):
                         num_rejected_tokens_gpu,
                     )
                 )
+
+            if ragged:
+                # Segment ragged-ly via query_start_loc (same pattern as
+                # _trim_rejected_target_context) and index each request's
+                # last non-rejected row to build the [B, H]/[B] draft anchors,
+                # with no rectangular view. The full ragged-flat hidden and
+                # positions flow to prefill_main, which scatters each segment
+                # into its slot's ring buffer.
+                assert query_starts is not None
+                flat_positions = target_positions.reshape(-1)
+                device = target_hidden_states.device
+                starts = torch.tensor(
+                    query_starts[:batch_size], device=device, dtype=torch.long
+                )
+                lengths = torch.tensor(
+                    [
+                        query_starts[i + 1] - query_starts[i]
+                        for i in range(batch_size)
+                    ],
+                    device=device,
+                    dtype=torch.long,
+                )
+                rejected = rejected_for_gpu_mask.to(
+                    device=device, dtype=torch.long, non_blocking=True
+                ).view(batch_size)
+                last_offsets = (lengths - rejected - 1).clamp(min=0)
+                last_offsets = torch.minimum(last_offsets, lengths - 1)
+                anchor_idx = starts + last_offsets
+                last_hidden = target_hidden_states.index_select(
+                    0, anchor_idx
+                ).contiguous()
+                last_positions = flat_positions.index_select(
+                    0, anchor_idx
+                ).contiguous()
+                return (
+                    target_hidden_states,
+                    flat_positions,
+                    last_hidden,
+                    last_positions,
+                    rejected_for_gpu_mask,
+                    query_starts,
+                )
+
             hidden_by_req = self._view_by_request(target_hidden_states, batch_size)
             positions_by_req = self._positions_by_request(target_positions, batch_size)
 
@@ -780,24 +907,36 @@ class DSparkProposer(SpecDecodeBaseProposer):
             else:
                 last_hidden = hidden_by_req[:, -1].contiguous()
                 last_positions = positions_by_req[:, -1].contiguous()
-            return hidden_by_req, positions_by_req, last_hidden, last_positions, (
-                rejected_for_gpu_mask
+            return (
+                hidden_by_req,
+                positions_by_req,
+                last_hidden,
+                last_positions,
+                rejected_for_gpu_mask,
+                prefill_query_start_loc,
             )
 
         (
-            hidden_by_req,
-            positions_by_req,
+            prefill_hidden,
+            prefill_positions,
             last_hidden,
             last_positions,
             rejected_for_gpu_mask,
+            prefill_query_start_loc,
         ) = self._timed_stage("context_prepare", prepare_context)
 
         self._timed_stage(
             "prefill_main",
             lambda: self.model.prefill_main(
-                hidden_by_req,
-                positions_by_req,
+                prefill_hidden,
+                prefill_positions,
                 num_rejected_tokens=rejected_for_gpu_mask,
+                slot_index=(
+                    slot_list
+                    if prefill_query_start_loc is not None
+                    else slot_index
+                ),
+                query_start_loc=prefill_query_start_loc,
             ),
         )
         if not self._prefilled:
@@ -816,6 +955,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 hidden_states=last_hidden,
                 positions=last_positions,
                 padded_batch_size=padded_batch_size,
+                slot_index=buffer_slot_index,
             )
             return (
                 cudagraph_runtime_mode,

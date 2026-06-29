@@ -11,8 +11,13 @@ This repo captures the validated 2026-06-29 checkpoint:
 - reported KV pool: `2,044,166 tokens`
 - reported max concurrency for 1M requests: `1.95x`
 - single-stream decode stayed above `50 tok/s`
+- DSpark in-server concurrency patch validated at `max_model_len=200000`,
+  `max_num_seqs=16`, with static C16 at `315.1 tok/s` aggregate and
+  staggered C16 at `205.0 tok/s` aggregate
 
 ## Result
+
+### 1M NVFP4 Profile
 
 Validated on 2x DGX Spark, one GPU per node, TP=2, single stream.
 
@@ -40,6 +45,42 @@ The API reported:
 The checkpoint note is in
 [`benchmarks/20260629-dspark-nvfp4-1m-context-checkpoint.md`](benchmarks/20260629-dspark-nvfp4-1m-context-checkpoint.md).
 
+### DSpark Concurrency Profile
+
+Validated on the same 2x DGX Spark TP=2 deployment using Keys' DSpark
+concurrency patch, `kv_cache_dtype=nvfp4_ds_mla`, `max_model_len=200000`,
+`max_num_seqs=16`, `MTP_NUM_TOKENS=5`, and
+`VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`.
+
+Patch source:
+
+- [drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash](https://github.com/drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash)
+- Tested commit: `7e4d94bbcec95223550517c0fa9244e59f9f6483`
+
+Static simultaneous batch, one TP=2 replica:
+
+| concurrency | best aggregate tok/s | per-stream tok/s | acceptance |
+| ---: | ---: | ---: | ---: |
+| 1 | 57.6 | 57.6 | 0.635 |
+| 4 | 140.8 | 35.2 | 0.619 |
+| 8 | 252.6 | 31.6 | 0.635 |
+| 16 | 315.1 | 19.7 | 0.609 |
+
+Staggered independent arrivals, one TP=2 replica:
+
+| concurrency | success | aggregate tok/s | acceptance |
+| ---: | ---: | ---: | ---: |
+| 4 | 4/4 | 109.2 | 0.544 |
+| 8 | 8/8 | 147.3 | 0.534 |
+| 16 | 16/16 | 205.0 | 0.567 |
+
+Correctness sanity check: deterministic victim output remained byte-identical
+under churn. A medium-churn condense test measured `0.529` acceptance and
+`99.7 tok/s` across the churn window.
+
+The checkpoint note is in
+[`benchmarks/20260629-dspark-keys-concurrency-checkpoint.md`](benchmarks/20260629-dspark-keys-concurrency-checkpoint.md).
+
 ## Important Caveat
 
 This is the **Stage C padded NVFP4** path. It keeps DeepSeek V4's known-good
@@ -53,8 +94,16 @@ reproducible recipe.
 
 ## Credits
 
+See [`CREDITS.md`](CREDITS.md) for the full attribution and license notes.
+
 This recipe stands on prior public work:
 
+- Keys / drowzeys' DSpark in-server concurrency patch:
+  [drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash](https://github.com/drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash).
+  This patch fixes the request-stable DSpark main-KV slot mapping and the
+  ragged `query_start_loc` path needed for real independent-arrival
+  continuous batching. The concurrency results in this repo depend directly on
+  that work.
 - Rafael Caricio's DSpark vLLM integration:
   [rafaelcaricio/vllm#1](https://github.com/rafaelcaricio/vllm/pull/1)
 - Rafael Caricio's DSpark deployment/runbook PR:
@@ -73,8 +122,9 @@ This recipe stands on prior public work:
   foundation.
 
 Our contribution here is the 1M NVFP4-KV checkpoint recipe, the Stage A/B/C
-runtime patches, sanitized two-node launch config, and measured benchmark
-artifact from the validated run.
+runtime patches, sanitized two-node launch config, applying and validating
+Keys' concurrency patch on the NVFP4 profile, and measured benchmark artifacts
+from the validated runs.
 
 ## License Notes
 
@@ -99,7 +149,9 @@ usage terms.
 | `prepare-dspark-model-cache.sh` | downloads/verifies the model cache |
 | `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test |
 | `stop-deepseek-v4-flash-dspark.sh` | stops head and worker services |
-| `benchmarks/` | measured 1M checkpoint evidence |
+| `patches/keys-concurrency.patch` | vendored copy of Keys' DSpark concurrency patch, path-adjusted for this repo |
+| `benchmarks/keys-concurrency/` | benchmark scripts from Keys' patch repo |
+| `benchmarks/` | measured 1M and concurrency checkpoint evidence |
 
 ## Quick Start
 
@@ -147,6 +199,8 @@ when you intentionally want to expose the API beyond the head node.
 
 ## Runtime Profile
 
+### 1M Single-Stream Profile
+
 Core vLLM flags:
 
 - `--tensor-parallel-size 2`
@@ -172,6 +226,24 @@ Key runtime env:
 - `VLLM_DSV4_B12X_COMPRESSED_MLA=0`
 - `VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE=0`
 - `B12X_W4A16_TC_DECODE=0`
+
+### 200k Concurrency Profile
+
+For DSpark concurrency, use the included overlay files with Keys'
+concurrency patch and set:
+
+- `MAX_MODEL_LEN=200000`
+- `MAX_NUM_SEQS=16`
+- `VLLM_USE_B12X_WO_PROJECTION=1`
+- `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
+
+Run the static and staggered checks:
+
+```bash
+python3 benchmarks/keys-concurrency/bench_concurrent.py http://127.0.0.1:8888 1,4,8,16
+python3 benchmarks/keys-concurrency/staggered_bench.py http://127.0.0.1:8888 16 0.4
+python3 benchmarks/keys-concurrency/correctness_test.py http://127.0.0.1:8888
+```
 
 ## Verify
 
@@ -204,6 +276,15 @@ Maximum concurrency for 1,048,576 tokens per request: 1.95x
 ## Notes
 
 - The benchmark is single stream, not aggregate throughput.
+- The concurrency benchmark is aggregate throughput and was validated at
+  `max_model_len=200000`, not full 1M context.
+- Full 1M context and high concurrency compete for the same KV pool. The
+  validated 1M boot reported `2,044,166` total KV tokens and `1.95x` maximum
+  concurrency for 1,048,576-token requests, so treat full-1M serving as a
+  `MAX_NUM_SEQS=1` profile unless you deliberately lower per-request context.
+- To combine DSpark concurrency with longer context, pick a lower context
+  target first, then raise concurrency slowly while watching boot logs, KV
+  allocation, acceptance, and request errors.
 - 1M was validated as booted/advertised `max_model_len` with KV headroom and
   short-prompt speed probes. This repo does not claim a full 1M-token retrieval
   or correctness benchmark.

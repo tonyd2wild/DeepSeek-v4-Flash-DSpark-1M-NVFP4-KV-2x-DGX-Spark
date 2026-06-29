@@ -5247,6 +5247,15 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
+            # DSpark keys its persistent draft KV by a stable per-request slot,
+            # so it needs the request ids in the same order used to build
+            # next_token_ids (the running input_batch order). Other proposers
+            # do not accept this argument.
+            dspark_propose_kwargs = (
+                {"req_ids": self.input_batch.req_ids}
+                if spec_config.use_dspark()
+                else {}
+            )
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -5258,6 +5267,7 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
+                **dspark_propose_kwargs,
             )
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
