@@ -1,0 +1,49 @@
+ARG BASE_IMAGE=vllm-dspark-runtime:mia-raf-pr1
+FROM ${BASE_IMAGE}
+
+RUN /opt/env/bin/python - <<'PY'
+from pathlib import Path
+
+root = Path("/opt/env/lib/python3.12/site-packages/vllm")
+
+def replace(path: str, old: str, new: str) -> None:
+    p = root / path
+    text = p.read_text()
+    if new in text:
+        return
+    if old not in text:
+        raise SystemExit(f"missing patch anchor in {p}: {old!r}")
+    p.write_text(text.replace(old, new, 1))
+
+replace(
+    "config/cache.py",
+    '    "fp8_ds_mla",\n    "turboquant_k8v4",',
+    '    "fp8_ds_mla",\n    "nvfp4_ds_mla",\n    "turboquant_k8v4",',
+)
+
+replace(
+    "utils/torch_utils.py",
+    '    "fp8_ds_mla": torch.uint8,\n    "turboquant_k8v4": torch.uint8,',
+    '    "fp8_ds_mla": torch.uint8,\n    "nvfp4_ds_mla": torch.uint8,\n    "turboquant_k8v4": torch.uint8,',
+)
+
+replace(
+    "utils/torch_utils.py",
+    '        or kv_cache_dtype == "nvfp4"\n',
+    '        or kv_cache_dtype == "nvfp4"\n        or kv_cache_dtype == "nvfp4_ds_mla"\n',
+)
+
+replace(
+    "v1/kv_cache_interface.py",
+    '    if kv_cache_dtype == "nvfp4":\n        return KVQuantMode.NVFP4\n',
+    '    if kv_cache_dtype == "nvfp4":\n        return KVQuantMode.NVFP4\n    if kv_cache_dtype == "nvfp4_ds_mla":\n        return KVQuantMode.NVFP4\n',
+)
+
+replace(
+    "v1/kv_cache_interface.py",
+    '        if self.cache_dtype_str == "fp8_ds_mla":\n',
+    '        if self.cache_dtype_str == "nvfp4_ds_mla":\n            return self.storage_block_size * 416\n        if self.cache_dtype_str == "fp8_ds_mla":\n',
+)
+
+print("Stage A nvfp4_ds_mla dtype plumbing applied")
+PY

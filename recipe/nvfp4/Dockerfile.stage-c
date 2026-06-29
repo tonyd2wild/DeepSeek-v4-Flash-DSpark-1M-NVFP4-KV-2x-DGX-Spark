@@ -1,0 +1,66 @@
+ARG BASE_IMAGE=vllm-dspark-runtime:mia-raf-pr1-nvfp4-b
+FROM ${BASE_IMAGE}
+
+RUN /opt/env/bin/python - <<'PY'
+from pathlib import Path
+
+root = Path("/opt/env/lib/python3.12/site-packages/vllm")
+
+def replace(path: str, old: str, new: str) -> None:
+    p = root / path
+    text = p.read_text()
+    if new in text:
+        return
+    if old not in text:
+        raise SystemExit(f"missing patch anchor in {p}: {old!r}")
+    p.write_text(text.replace(old, new, 1))
+
+replace(
+    "models/deepseek_v4/attention.py",
+    """        if (
+            cache_config is not None
+            and cache_config.cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+        ):
+            # Probe layout from the GLM-5.2 NVFP4 sparse-MLA path.
+            head_bytes = 416
+""",
+    """        if (
+            cache_config is not None
+            and cache_config.cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+        ):
+            # Stage C: keep DeepSeek V4's proven 584-byte cache envelope so
+            # hybrid MLA/SWA grouping can proceed while testing nvfp4_ds_mla.
+            head_bytes = 584
+""",
+)
+
+replace(
+    "models/deepseek_v4/nvidia/flashmla.py",
+    """        if cache_dtype_str == "nvfp4_ds_mla":
+            # Probe layout from GLM-5.2 NVFP4 sparse MLA. This is expected to
+            # expose whether DeepSeek V4 has compatible store/decode kernels.
+            return (num_blocks, block_size, 416)
+""",
+    """        if cache_dtype_str == "nvfp4_ds_mla":
+            # Stage C: DeepSeek V4 padded NVFP4 probe. Match the fp8_ds_mla
+            # envelope first; if this boots, kernel/store correctness is next.
+            return (num_blocks, block_size, 584)
+""",
+)
+
+replace(
+    "v1/kv_cache_interface.py",
+    """        if self.cache_dtype_str == "nvfp4_ds_mla":
+            return self.storage_block_size * 416
+        if self.cache_dtype_str == "fp8_ds_mla":
+""",
+    """        if self.cache_dtype_str == "nvfp4_ds_mla":
+            if self.model_version == "deepseek_v4":
+                return self.storage_block_size * 584
+            return self.storage_block_size * 416
+        if self.cache_dtype_str == "fp8_ds_mla":
+""",
+)
+
+print("Stage C DeepSeek V4 nvfp4_ds_mla padded page probe applied")
+PY

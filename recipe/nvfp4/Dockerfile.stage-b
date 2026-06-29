@@ -1,0 +1,113 @@
+ARG BASE_IMAGE=vllm-dspark-runtime:mia-raf-pr1-nvfp4-a
+FROM ${BASE_IMAGE}
+
+RUN /opt/env/bin/python - <<'PY'
+from pathlib import Path
+
+root = Path("/opt/env/lib/python3.12/site-packages/vllm")
+
+def replace(path: str, old: str, new: str) -> None:
+    p = root / path
+    text = p.read_text()
+    if new in text:
+        return
+    if old not in text:
+        raise SystemExit(f"missing patch anchor in {p}: {old!r}")
+    p.write_text(text.replace(old, new, 1))
+
+replace(
+    "models/deepseek_v4/attention.py",
+    """        # TODO(yifan): currently hardcoded for FP8 sparse, make it more generic
+        head_bytes = (
+            self.nope_head_dim  # 448 fp8 NoPE
+            + self.rope_head_dim * 2  # 64 bf16 RoPE
+            + self.nope_head_dim // 64  # 7B scale factors
+            + 1  # 1B pad
+        )
+""",
+    """        # TODO(yifan): currently hardcoded for FP8 sparse, make it more generic
+        head_bytes = (
+            self.nope_head_dim  # 448 fp8 NoPE
+            + self.rope_head_dim * 2  # 64 bf16 RoPE
+            + self.nope_head_dim // 64  # 7B scale factors
+            + 1  # 1B pad
+        )
+        if (
+            cache_config is not None
+            and cache_config.cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+        ):
+            # Probe layout from the GLM-5.2 NVFP4 sparse-MLA path.
+            head_bytes = 416
+""",
+)
+
+replace(
+    "models/deepseek_v4/attention.py",
+    """        assert kv_cache_dtype.startswith("fp8"), (
+            f"DeepseekV4 only supports fp8 kv-cache format for now, "
+            f"got {kv_cache_dtype}"
+        )
+""",
+    """        assert (
+            kv_cache_dtype.startswith("fp8")
+            or kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+        ), (
+            f"DeepseekV4 only supports fp8/nvfp4_ds_mla kv-cache format for now, "
+            f"got {kv_cache_dtype}"
+        )
+""",
+)
+
+replace(
+    "models/deepseek_v4/attention.py",
+    """        # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
+        # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
+        if (
+            issubclass(self.get_attn_backend(), FlashMLASparseBackend)
+            and kv_cache_dtype.startswith("fp8")
+            and kv_cache_dtype != "fp8_ds_mla"
+        ):
+""",
+    """        if (
+            issubclass(self.get_attn_backend(), FlashMLASparseBackend)
+            and kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+        ):
+            assert cache_config is not None
+            cache_config.cache_dtype = "nvfp4_ds_mla"
+            kv_cache_dtype = "nvfp4_ds_mla"
+            logger.info_once("Using probe DeepSeek V4 nvfp4_ds_mla KV cache format.")
+
+        # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
+        # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
+        if (
+            issubclass(self.get_attn_backend(), FlashMLASparseBackend)
+            and kv_cache_dtype.startswith("fp8")
+            and kv_cache_dtype != "fp8_ds_mla"
+        ):
+""",
+)
+
+replace(
+    "models/deepseek_v4/nvidia/flashmla.py",
+    """        if cache_dtype_str == "fp8_ds_mla":
+            # DeepseekV4 main MLA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
+            # head_size passed in is the semantic head_dim (512).
+            return (num_blocks, block_size, 584)
+        else:
+            return (num_blocks, block_size, head_size)
+""",
+    """        if cache_dtype_str == "nvfp4_ds_mla":
+            # Probe layout from GLM-5.2 NVFP4 sparse MLA. This is expected to
+            # expose whether DeepSeek V4 has compatible store/decode kernels.
+            return (num_blocks, block_size, 416)
+        if cache_dtype_str == "fp8_ds_mla":
+            # DeepseekV4 main MLA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
+            # head_size passed in is the semantic head_dim (512).
+            return (num_blocks, block_size, 584)
+        else:
+            return (num_blocks, block_size, head_size)
+""",
+)
+
+print("Stage B DeepSeek V4 nvfp4_ds_mla probe patches applied")
+PY
