@@ -148,6 +148,57 @@ never near 1M, so 6 normal-length sessions share the pool comfortably while the
 `1M + max_num_seqs=6` is safe: you are not reserving 6×1M, you are sharing one
 ~1.9M pool across short requests under a high ceiling.
 
+## Gotcha: gibberish, loops, Chinese drift, or prompt/XML leakage
+
+If the model boots and basic prompts like `hi` work, but real agent traffic
+randomly turns into repeated characters, Chinese drift, leaked tool/schema XML,
+or Telegram-visible junk, do not assume the weights are bad.
+
+On this deployment there were two separate fixes:
+
+1. **Runtime concurrency safety:** make sure the Keys Patch 2b logic is present
+   in `recipe/overlay/vllm/v1/spec_decode/dspark_proposer.py`. The important
+   behavior is that ragged `query_start_loc` handling does not depend on
+   `num_rejected_tokens_gpu`, and the no-rejection path creates a zero rejected
+   token tensor instead of falling through to unsafe request reshaping. Without
+   this, concurrent DSpark requests can mix context.
+2. **Agent decode/fallback safety:** for long OpenAI-compatible agent prompts,
+   avoid unstable sampling and hidden fallback transitions. The production
+   OpenClaw test profile used deterministic decode plus a small repetition
+   penalty:
+
+```json
+{
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "repetition_penalty": 1.08,
+  "include_reasoning": false,
+  "reasoning_effort": "none",
+  "chat_template_kwargs": {
+    "thinking": false,
+    "enable_thinking": false
+  }
+}
+```
+
+Also clear agent fallback lists during validation. A model that looks fixed in
+direct vLLM tests can still appear poisoned if the orchestration layer silently
+falls back, reboots a session, or injects a long workspace/tool prompt into the
+visible message stream.
+
+Validation after the live fix:
+
+```text
+3 sequential direct vLLM prompts: clean
+6 concurrent direct vLLM prompts: clean
+12 delivered Sage Telegram turns through OpenClaw: clean, DeepSeek, no fallback
+MTP5 accepted-token positions 0..4 active
+```
+
+This keeps NVFP4 KV and MTP5. Do not switch to fp8 or drop to a smaller fallback
+model just to hide the symptom unless you intentionally accept the context and
+quality tradeoff.
+
 ## Important Caveat
 
 This is the **Stage C padded NVFP4** path. It keeps DeepSeek V4's known-good
