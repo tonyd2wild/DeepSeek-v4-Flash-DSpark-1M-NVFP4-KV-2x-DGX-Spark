@@ -807,10 +807,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
             prefill_query_start_loc: list[int] | None = None
             ragged = False
             query_starts: list[int] | None = None
-            if (
-                getattr(self, "_gpu_rejected_context_mask", False)
-                and num_rejected_tokens_gpu is not None
-            ):
+            if getattr(self, "_gpu_rejected_context_mask", False):
                 rejected_for_gpu_mask = num_rejected_tokens_gpu
                 # Detect non-uniform per-request query rows (mixed prefill +
                 # decode under chunked prefill). Only then do we need the ragged
@@ -859,9 +856,14 @@ class DSparkProposer(SpecDecodeBaseProposer):
                     device=device,
                     dtype=torch.long,
                 )
-                rejected = rejected_for_gpu_mask.to(
-                    device=device, dtype=torch.long, non_blocking=True
-                ).view(batch_size)
+                if rejected_for_gpu_mask is None:
+                    rejected = torch.zeros(
+                        batch_size, device=device, dtype=torch.long
+                    )
+                else:
+                    rejected = rejected_for_gpu_mask.to(
+                        device=device, dtype=torch.long, non_blocking=True
+                    ).view(batch_size)
                 last_offsets = (lengths - rejected - 1).clamp(min=0)
                 last_offsets = torch.minimum(last_offsets, lengths - 1)
                 anchor_idx = starts + last_offsets

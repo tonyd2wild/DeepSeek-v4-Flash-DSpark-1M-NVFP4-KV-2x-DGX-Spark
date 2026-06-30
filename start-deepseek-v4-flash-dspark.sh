@@ -26,13 +26,17 @@ set +a
 
 cd "$SCRIPT_DIR"
 
-echo "Syncing DSpark deployment files to ${WORKER_HOST}:${SCRIPT_DIR}"
-ssh "$WORKER_HOST" "mkdir -p '$SCRIPT_DIR'"
-scp "$COMPOSE_FILE" "${WORKER_HOST}:${SCRIPT_DIR}/docker-compose.dspark.yml"
-scp "$ENV_FILE" "${WORKER_HOST}:${SCRIPT_DIR}/.env.dspark"
+WORKER_DIR="${WORKER_DIR:-$SCRIPT_DIR}"
+REMOTE_WORKER_DIR="$(printf '%q' "$WORKER_DIR")"
+REMOTE_COMPOSE="cd $REMOTE_WORKER_DIR && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1"
+
+echo "Syncing DSpark deployment files to ${WORKER_HOST}:${WORKER_DIR}"
+ssh "$WORKER_HOST" "mkdir -p $REMOTE_WORKER_DIR"
+scp "$COMPOSE_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/docker-compose.dspark.yml"
+scp "$ENV_FILE" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/.env.dspark"
 
 echo "Starting DSpark worker on ${WORKER_HOST}..."
-ssh "$WORKER_HOST" "cd '$SCRIPT_DIR' && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 NODE_RANK=1 HEADLESS=1 docker compose --env-file .env.dspark -f docker-compose.dspark.yml up -d"
+ssh "$WORKER_HOST" "$REMOTE_COMPOSE NODE_RANK=1 HEADLESS=1 docker compose --env-file .env.dspark -f docker-compose.dspark.yml up -d"
 
 echo "Starting DSpark head..."
 COMPOSE_DISABLE_ENV_FILE=1 NODE_RANK=0 HEADLESS= docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d
@@ -42,7 +46,7 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
   if curl -fsS --max-time 5 "$API_URL" >/dev/null; then
     echo "DeepSeek V4 Flash DSpark is running: $API_URL"
     COMPOSE_DISABLE_ENV_FILE=1 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps
-    ssh "$WORKER_HOST" "cd '$SCRIPT_DIR' && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 docker compose --env-file .env.dspark -f docker-compose.dspark.yml ps"
+    ssh "$WORKER_HOST" "$REMOTE_COMPOSE docker compose --env-file .env.dspark -f docker-compose.dspark.yml ps"
     echo "Running minimal OpenAI-compatible chat request..."
     curl -fsS --max-time 60 "$CHAT_URL" \
       -H "Content-Type: application/json" \
@@ -56,5 +60,5 @@ done
 echo "Timed out waiting for DSpark API. Recent head logs:" >&2
 COMPOSE_DISABLE_ENV_FILE=1 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs --tail=120 vllm-dspark >&2 || true
 echo "Recent worker logs:" >&2
-ssh "$WORKER_HOST" "cd '$SCRIPT_DIR' && env -u MASTER_ADDR -u MASTER_PORT -u NODE_RANK -u HEADLESS COMPOSE_DISABLE_ENV_FILE=1 docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs --tail=120 vllm-dspark" >&2 || true
+ssh "$WORKER_HOST" "$REMOTE_COMPOSE docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs --tail=120 vllm-dspark" >&2 || true
 exit 1
