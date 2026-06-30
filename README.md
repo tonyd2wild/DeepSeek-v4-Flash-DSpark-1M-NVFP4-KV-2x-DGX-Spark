@@ -55,7 +55,14 @@ concurrency patch, `kv_cache_dtype=nvfp4_ds_mla`, `max_model_len=200000`,
 Patch source:
 
 - [drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash](https://github.com/drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash)
-- Tested commit: `7e4d94bbcec95223550517c0fa9244e59f9f6483`
+- Vendored commit: `961d97b5ded1076c37429bf2820753ddac8d9a22`
+
+The live fix documented here keeps `kv_cache_dtype=nvfp4_ds_mla` and refreshes
+the repo's already-vendored Keys overlay with the path-adjusted Patch 2b update
+from that commit. In Patch 2b, ragged `query_start_loc` detection no longer
+depends on `num_rejected_tokens_gpu`. Treat the service as validated only after
+the built-in OpenAI-compatible chat smoke request plus agent-client validation
+pass on the live service.
 
 Static simultaneous batch, one TP=2 replica:
 
@@ -207,9 +214,9 @@ usage terms.
 | `.env.dspark.example` | sanitized cluster configuration template |
 | `build-dspark-vllm-runtime.sh` | builds the Stage C image locally and on the worker |
 | `prepare-dspark-model-cache.sh` | downloads/verifies the model cache |
-| `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test |
+| `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test; honors `WORKER_DIR` for worker-local paths |
 | `stop-deepseek-v4-flash-dspark.sh` | stops head and worker services |
-| `patches/keys-concurrency.patch` | vendored copy of Keys' DSpark concurrency patch, path-adjusted for this repo |
+| `patches/keys-concurrency.patch` | path-adjusted Keys Patch 2b update for this repo's already-vendored DSpark concurrency overlay |
 | `benchmarks/keys-concurrency/` | benchmark scripts from Keys' patch repo |
 | `benchmarks/` | measured 1M and concurrency checkpoint evidence |
 
@@ -224,6 +231,7 @@ cp .env.dspark.example .env.dspark
 Edit these values for your cluster:
 
 - `WORKER_HOST`
+- `WORKER_DIR` if the worker checkout/deployment path differs from the head
 - `MASTER_ADDR`
 - `NCCL_IB_HCA`
 - `NCCL_SOCKET_IFNAME`
