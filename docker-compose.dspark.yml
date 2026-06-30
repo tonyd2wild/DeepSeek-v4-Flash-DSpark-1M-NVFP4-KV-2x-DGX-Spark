@@ -104,7 +104,9 @@ services:
         --enable-auto-tool-choice
         --reasoning-parser deepseek_v4
         --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
-        --default-chat-template-kwargs '{"thinking":true}'
+        --default-chat-template-kwargs '{"thinking":false}'
+        --generation-config vllm
+        --override-generation-config '{"temperature":0.0,"top_p":1.0}'
         --enable-flashinfer-autotune
         --nnodes 2
         --node-rank ${NODE_RANK}

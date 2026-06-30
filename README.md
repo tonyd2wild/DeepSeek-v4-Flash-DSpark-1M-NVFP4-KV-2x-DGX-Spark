@@ -88,6 +88,25 @@ under churn. A medium-churn condense test measured `0.529` acceptance and
 The checkpoint note is in
 [`benchmarks/20260629-dspark-keys-concurrency-checkpoint.md`](benchmarks/20260629-dspark-keys-concurrency-checkpoint.md).
 
+### Historical 60 tok/s DSpark Baseline
+
+The older ~60 tok/s number was reproduced, but it is a separate diagnostic
+profile, not this repo's default 1M NVFP4 deployment:
+
+- image rebuilt from `rafaelcaricio/vllm#1` commit `3519c3b88`
+- `max_model_len=262144`
+- `max_num_seqs=1`
+- `kv_cache_dtype=fp8`
+- `MTP_NUM_TOKENS=5`
+- `thinking=false`
+- `temperature=0.0`, `top_p=1.0`
+- measured `63.97 tok/s` on the `code_completion` gate with `67.9%`
+  DSpark acceptance
+
+Use this to diagnose image/runtime drift. Do not confuse it with the production
+1M NVFP4 path. The checkpoint note is in
+[`benchmarks/20260630-dspark-pr-head-262k-fp8-speed-baseline.md`](benchmarks/20260630-dspark-pr-head-262k-fp8-speed-baseline.md).
+
 ### Full-1M Concurrency Profile (production: 1M / max_num_seqs=6)
 
 The 200K/16 profile above maximizes raw concurrency. For agent fleets that want
@@ -154,7 +173,7 @@ If the model boots and basic prompts like `hi` work, but real agent traffic
 randomly turns into repeated characters, Chinese drift, leaked tool/schema XML,
 or Telegram-visible junk, do not assume the weights are bad.
 
-On this deployment there were two separate fixes:
+On this deployment there are three checks to make before blaming the weights:
 
 1. **Runtime concurrency safety:** make sure the Keys Patch 2b logic is present
    in `recipe/overlay/vllm/v1/spec_decode/dspark_proposer.py`. The important
@@ -162,16 +181,18 @@ On this deployment there were two separate fixes:
    `num_rejected_tokens_gpu`, and the no-rejection path creates a zero rejected
    token tensor instead of falling through to unsafe request reshaping. Without
    this, concurrent DSpark requests can mix context.
-2. **Agent decode/fallback safety:** for long OpenAI-compatible agent prompts,
-   avoid unstable sampling and hidden fallback transitions. The production
-   OpenClaw test profile used deterministic decode plus a small repetition
-   penalty:
+2. **Runtime image provenance:** make sure the image really contains the current
+   DSpark overlay. A reused local tag named `vllm-dspark-runtime:clean` caused
+   misleading failures even though a nearby PR-head image worked. Rebuild from
+   the intended overlay commit when in doubt.
+3. **Decode/fallback safety:** for long OpenAI-compatible agent prompts, avoid
+   unstable sampling and hidden fallback transitions. The server default should
+   ignore the model card's sampling defaults and use deterministic generation:
 
 ```json
 {
   "temperature": 0.0,
   "top_p": 1.0,
-  "repetition_penalty": 1.08,
   "include_reasoning": false,
   "reasoning_effort": "none",
   "chat_template_kwargs": {
@@ -181,24 +202,24 @@ On this deployment there were two separate fixes:
 }
 ```
 
+The compose launcher now includes `--generation-config vllm` plus
+`--override-generation-config '{"temperature":0.0,"top_p":1.0}'` and
+`thinking=false` so default requests do not inherit unstable model-card sampling.
+Agent harnesses may still add a small repetition penalty during validation if
+they see loops.
+
 Also clear agent fallback lists during validation. A model that looks fixed in
 direct vLLM tests can still appear poisoned if the orchestration layer silently
-falls back, reboots a session, or injects a long workspace/tool prompt into the
-visible message stream.
+falls back, reboots a session, or replays a stale prompt/tool transcript into
+the visible message stream. Keep OpenClaw/Hermes changes separate from model
+runtime validation unless you are deliberately testing that harness.
 
-For OpenClaw/Hermes-style supervisor traffic, the validated orchestration fix
-was **bounded bootstrap**: keep enough agent identity/context for normal
-conversation, but cap injected workspace files, startup memory, skill prompts,
-tool result replay, and tool schemas so they do not poison DeepSeek. The
-checkpoint is documented in
-[`benchmarks/20260630-openclaw-bounded-bootstrap-checkpoint.md`](benchmarks/20260630-openclaw-bounded-bootstrap-checkpoint.md).
-
-Validation after the live fix:
+Validation gates to run after a live fix:
 
 ```text
-3 sequential direct vLLM prompts: clean
-6 concurrent direct vLLM prompts: clean
-12 delivered Sage Telegram turns through OpenClaw: clean, DeepSeek, no fallback
+direct vLLM prompts: clean
+direct concurrent vLLM prompts: clean
+agent harness prompts: clean, DeepSeek, no fallback
 MTP5 accepted-token positions 0..4 active
 ```
 
