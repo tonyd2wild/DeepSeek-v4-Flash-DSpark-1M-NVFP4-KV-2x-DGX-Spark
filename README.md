@@ -55,7 +55,14 @@ concurrency patch, `kv_cache_dtype=nvfp4_ds_mla`, `max_model_len=200000`,
 Patch source:
 
 - [drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash](https://github.com/drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash)
-- Tested commit: `7e4d94bbcec95223550517c0fa9244e59f9f6483`
+- Vendored commit: `961d97b5ded1076c37429bf2820753ddac8d9a22`
+
+The live fix documented here keeps `kv_cache_dtype=nvfp4_ds_mla` and refreshes
+the repo's already-vendored Keys overlay with the path-adjusted Patch 2b update
+from that commit. In Patch 2b, ragged `query_start_loc` detection no longer
+depends on `num_rejected_tokens_gpu`. Treat the service as validated only after
+the built-in OpenAI-compatible chat smoke request plus agent-client validation
+pass on the live service.
 
 Static simultaneous batch, one TP=2 replica:
 
@@ -141,6 +148,57 @@ never near 1M, so 6 normal-length sessions share the pool comfortably while the
 `1M + max_num_seqs=6` is safe: you are not reserving 6×1M, you are sharing one
 ~1.9M pool across short requests under a high ceiling.
 
+## Gotcha: gibberish, loops, Chinese drift, or prompt/XML leakage
+
+If the model boots and basic prompts like `hi` work, but real agent traffic
+randomly turns into repeated characters, Chinese drift, leaked tool/schema XML,
+or Telegram-visible junk, do not assume the weights are bad.
+
+On this deployment there were two separate fixes:
+
+1. **Runtime concurrency safety:** make sure the Keys Patch 2b logic is present
+   in `recipe/overlay/vllm/v1/spec_decode/dspark_proposer.py`. The important
+   behavior is that ragged `query_start_loc` handling does not depend on
+   `num_rejected_tokens_gpu`, and the no-rejection path creates a zero rejected
+   token tensor instead of falling through to unsafe request reshaping. Without
+   this, concurrent DSpark requests can mix context.
+2. **Agent decode/fallback safety:** for long OpenAI-compatible agent prompts,
+   avoid unstable sampling and hidden fallback transitions. The production
+   OpenClaw test profile used deterministic decode plus a small repetition
+   penalty:
+
+```json
+{
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "repetition_penalty": 1.08,
+  "include_reasoning": false,
+  "reasoning_effort": "none",
+  "chat_template_kwargs": {
+    "thinking": false,
+    "enable_thinking": false
+  }
+}
+```
+
+Also clear agent fallback lists during validation. A model that looks fixed in
+direct vLLM tests can still appear poisoned if the orchestration layer silently
+falls back, reboots a session, or injects a long workspace/tool prompt into the
+visible message stream.
+
+Validation after the live fix:
+
+```text
+3 sequential direct vLLM prompts: clean
+6 concurrent direct vLLM prompts: clean
+12 delivered Sage Telegram turns through OpenClaw: clean, DeepSeek, no fallback
+MTP5 accepted-token positions 0..4 active
+```
+
+This keeps NVFP4 KV and MTP5. Do not switch to fp8 or drop to a smaller fallback
+model just to hide the symptom unless you intentionally accept the context and
+quality tradeoff.
+
 ## Important Caveat
 
 This is the **Stage C padded NVFP4** path. It keeps DeepSeek V4's known-good
@@ -207,9 +265,9 @@ usage terms.
 | `.env.dspark.example` | sanitized cluster configuration template |
 | `build-dspark-vllm-runtime.sh` | builds the Stage C image locally and on the worker |
 | `prepare-dspark-model-cache.sh` | downloads/verifies the model cache |
-| `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test |
+| `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test; honors `WORKER_DIR` for worker-local paths |
 | `stop-deepseek-v4-flash-dspark.sh` | stops head and worker services |
-| `patches/keys-concurrency.patch` | vendored copy of Keys' DSpark concurrency patch, path-adjusted for this repo |
+| `patches/keys-concurrency.patch` | path-adjusted Keys Patch 2b update for this repo's already-vendored DSpark concurrency overlay |
 | `benchmarks/keys-concurrency/` | benchmark scripts from Keys' patch repo |
 | `benchmarks/` | measured 1M and concurrency checkpoint evidence |
 
@@ -224,6 +282,7 @@ cp .env.dspark.example .env.dspark
 Edit these values for your cluster:
 
 - `WORKER_HOST`
+- `WORKER_DIR` if the worker checkout/deployment path differs from the head
 - `MASTER_ADDR`
 - `NCCL_IB_HCA`
 - `NCCL_SOCKET_IFNAME`
@@ -259,7 +318,7 @@ when you intentionally want to expose the API beyond the head node.
 
 ## Runtime Profile
 
-### 1M Single-Stream Profile
+### 1M Keys-Concurrency Profile
 
 Core vLLM flags:
 
@@ -269,15 +328,16 @@ Core vLLM flags:
 - `--kv-cache-dtype nvfp4_ds_mla`
 - `--block-size 256`
 - `--max-model-len 1048576`
-- `--max-num-seqs 1`
+- `--max-num-seqs 6`
 - `--max-num-batched-tokens 8192`
 - `--gpu-memory-utilization 0.80`
-- `--speculative-config '{"method":"dspark","num_speculative_tokens":5}'`
+- `--speculative-config '{"method":"dspark","num_speculative_tokens":${MTP_NUM_TOKENS:-5}}'`
 
 Key runtime env:
 
 - `VLLM_USE_B12X_MOE=1`
-- `VLLM_USE_B12X_WO_PROJECTION=0`
+- `VLLM_USE_B12X_WO_PROJECTION=1`
+- `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
 - `VLLM_DSPARK_CONFIDENCE_SCHEDULER=off`
 - `VLLM_DSPARK_LOCAL_ARGMAX=1`
 - `VLLM_DSPARK_REPLICATE_MARKOV_W1=1`
@@ -305,6 +365,13 @@ python3 benchmarks/keys-concurrency/staggered_bench.py http://127.0.0.1:8888 16 
 python3 benchmarks/keys-concurrency/correctness_test.py http://127.0.0.1:8888
 ```
 
+### 1M Single-Stream Legacy Profile
+
+For conservative single-stream testing, set `MAX_NUM_SEQS=1` and
+`VLLM_USE_B12X_WO_PROJECTION=0`. Keep `MTP_NUM_TOKENS=5` unless you are
+deliberately running an experiment; upstream Mia and Keys both validate the
+DSpark path at MTP5.
+
 ## Verify
 
 After launch:
@@ -326,22 +393,21 @@ docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs vllm-dsp
   | grep -E "GPU KV cache size|Maximum concurrency"
 ```
 
-Expected checkpoint values:
+Expected 1M/6 checkpoint values are around:
 
 ```text
-GPU KV cache size: 2,044,166 tokens
-Maximum concurrency for 1,048,576 tokens per request: 1.95x
+GPU KV cache size: 1.6M-1.9M tokens
+Maximum concurrency for 1,048,576 tokens per request: 1.5x-1.8x
 ```
 
 ## Notes
 
-- The benchmark is single stream, not aggregate throughput.
-- The concurrency benchmark is aggregate throughput and was validated at
+- The old speed checkpoint is single stream, not aggregate throughput.
+- The high-concurrency benchmark is aggregate throughput and was validated at
   `max_model_len=200000`, not full 1M context.
 - Full 1M context and high concurrency compete for the same KV pool. The
-  validated 1M boot reported `2,044,166` total KV tokens and `1.95x` maximum
-  concurrency for 1,048,576-token requests, so treat full-1M serving as a
-  `MAX_NUM_SEQS=1` profile unless you deliberately lower per-request context.
+  1M/6 profile is intended for normal agent traffic where most sessions sit far
+  below the 1M ceiling; it is not six simultaneous full-1M requests.
 - To combine DSpark concurrency with longer context, pick a lower context
   target first, then raise concurrency slowly while watching boot logs, KV
   allocation, acceptance, and request errors.
@@ -351,8 +417,9 @@ Maximum concurrency for 1,048,576 tokens per request: 1.95x
 - The measured probes were p256/p512 with g64/g256. Rebenchmark if you change
   sampling, batching, context length, WO projection, compressed MLA, or the
   confidence scheduler.
-- The validated profile is `MAX_NUM_SEQS=1`, greedy/low-concurrency oriented,
-  `VLLM_USE_B12X_WO_PROJECTION=0`, and `VLLM_DSV4_B12X_COMPRESSED_MLA=0`.
+- The current validated agent-serving profile is `MAX_NUM_SEQS=6`,
+  `MTP_NUM_TOKENS=5`, `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`,
+  `VLLM_USE_B12X_WO_PROJECTION=1`, and `VLLM_DSV4_B12X_COMPRESSED_MLA=0`.
 - Worker-first startup avoids a race during multi-node `mp` initialization.
 - Requires matching images on both nodes, correct NCCL/RoCE settings, and a
   two-node Blackwell-class/DGX Spark setup.
