@@ -96,7 +96,7 @@ services:
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.80}
         --enable-prefix-caching
-        --speculative-config '{"method":"dspark","num_speculative_tokens":$${MTP_NUM_TOKENS}}'
+        --speculative-config '{"method":"dspark","num_speculative_tokens":${MTP_NUM_TOKENS}}'
         --tokenizer-mode deepseek_v4
         --distributed-executor-backend mp
         --tool-call-parser deepseek_v4
