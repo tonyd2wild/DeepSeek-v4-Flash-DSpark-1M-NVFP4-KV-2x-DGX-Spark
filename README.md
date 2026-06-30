@@ -4,18 +4,75 @@ Self-contained two-node DGX Spark recipe for serving `DeepSeek-V4-Flash-DSpark`
 with vLLM TP=2, DSpark speculative decoding, and a 1M-token max model length
 using the experimental `nvfp4_ds_mla` KV-cache path.
 
-This repo captures the validated 2026-06-29 checkpoint:
+This repo captures the validated 1M NVFP4 checkpoint and the 2026-06-30
+agent-stability refresh:
 
 - `max_model_len=1048576`
 - `kv_cache_dtype=nvfp4_ds_mla`
-- reported KV pool: `2,044,166 tokens`
-- reported max concurrency for 1M requests: `1.95x`
+- reported KV pool: about `1.9M-2.0M tokens`
+- reported max concurrency for 1M requests: about `1.8x-1.9x`
 - single-stream decode stayed above `50 tok/s`
+- deterministic direct prompts completed with no Chinese drift or repeated junk
+- 2/4/6 concurrent direct prompts completed cleanly
 - DSpark in-server concurrency patch validated at `max_model_len=200000`,
   `max_num_seqs=16`, with static C16 at `315.1 tok/s` aggregate and
   staggered C16 at `205.0 tok/s` aggregate
 
+If you already deployed an older copy and saw agent garble, loops, Chinese
+drift, or prompt/tool XML leaking into replies, start with
+[`AGENT_GARBLE_FIX.md`](AGENT_GARBLE_FIX.md). The fix path keeps the 1M NVFP4
+profile; it does not switch production to fp8 or a smaller fallback model.
+
 ## Result
+
+### 2026-06-30 Clean Agent-Serving Checkpoint
+
+The latest clean endpoint was reproduced on Asusi/Spark4 before sending the
+model back through Hermes/OpenClaw-style harnesses.
+
+Runtime:
+
+- endpoint tested: `http://100.90.25.78:8888/v1`
+- served model: `deepseek-v4-flash-dspark`
+- image used on that lane: `vllm-dspark-runtime:mia-raf-pr1-nvfp4-keys-c`
+- model path: `/cache/huggingface/fraserprice/DeepSeek-V4-Flash-DSpark`
+- `kv_cache_dtype=nvfp4_ds_mla`
+- `max_model_len=1048576`
+- `max_num_seqs=6`
+- `max_num_batched_tokens=8192`
+- `gpu_memory_utilization=0.80`
+- `MTP_NUM_TOKENS=5`
+- `thinking=false`
+- `--generation-config vllm`
+- `--override-generation-config '{"temperature":0.0,"top_p":1.0}'`
+- explicit per-node `VLLM_HOST_IP` values
+
+Boot evidence:
+
+```text
+GPU KV cache size: 1,990,142 tokens
+Maximum concurrency for 1,048,576 tokens per request: 1.90x
+Application startup complete.
+```
+
+Direct validation:
+
+- `/v1/models` reported `"max_model_len": 1048576`
+- deterministic sanity prompt returned `NVFP4 DSPARK OK`
+- five longer English prompts completed with no CJK drift and no repeated junk
+- code-gate server decode mean: `54.22 tok/s`
+- 2/4/6 concurrent direct prompts all succeeded cleanly
+
+Concurrency:
+
+| concurrency | success | aggregate tok/s | stability |
+| ---: | ---: | ---: | --- |
+| 2 | 2/2 | 60.95 | no CJK/repeat junk |
+| 4 | 4/4 | 83.21 | no CJK/repeat junk |
+| 6 | 6/6 | 104.11 | no CJK/repeat junk |
+
+The checkpoint note is in
+[`benchmarks/20260630-asusi-spark4-nvfp4-1m-agent-stability.md`](benchmarks/20260630-asusi-spark4-nvfp4-1m-agent-stability.md).
 
 ### 1M NVFP4 Profile
 
@@ -55,7 +112,7 @@ concurrency patch, `kv_cache_dtype=nvfp4_ds_mla`, `max_model_len=200000`,
 Patch source:
 
 - [drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash](https://github.com/drowzeys/Keys-Concurrency-Patch-for-DSpark-DeepSeek-V4-Flash)
-- Vendored commit: `961d97b5ded1076c37429bf2820753ddac8d9a22`
+- Tested patch commit: `7e4d94bbcec95223550517c0fa9244e59f9f6483`
 
 The live fix documented here keeps `kv_cache_dtype=nvfp4_ds_mla` and refreshes
 the repo's already-vendored Keys overlay with the path-adjusted Patch 2b update
@@ -107,7 +164,7 @@ Use this to diagnose image/runtime drift. Do not confuse it with the production
 1M NVFP4 path. The checkpoint note is in
 [`benchmarks/20260630-dspark-pr-head-262k-fp8-speed-baseline.md`](benchmarks/20260630-dspark-pr-head-262k-fp8-speed-baseline.md).
 
-### Full-1M Concurrency Profile (production: 1M / max_num_seqs=6)
+### 2026-06-29 Full-1M Concurrency Microbench
 
 The 200K/16 profile above maximizes raw concurrency. For agent fleets that want
 the **full 1M context ceiling AND concurrency**, run `max_model_len=1048576`
@@ -115,16 +172,18 @@ with `max_num_seqs=6`. Every request can still grow to 1M while up to 6 sessions
 run at once, because the shared KV pool — not a per-slot reservation — is the
 real limit (see [How the KV cache works](#how-the-kv-cache-works-why-1m--concurrency-is-safe)).
 
-Validated on this deployment (NVFP4, `max_model_len=1048576`, `max_num_seqs=6`,
+Validated on the 2026-06-29 code-completion microbench deployment (NVFP4,
+`max_model_len=1048576`, `max_num_seqs=6`,
 `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`, `VLLM_USE_B12X_WO_PROJECTION=1`):
 
 - Boot: `GPU KV cache size: 1,901,239 tokens`, `Maximum concurrency for 1,048,576 tokens per request: 1.81x`
 - 6 concurrent requests: **6/6 success**, **~182 tok/s aggregate** (~30 tok/s per stream), no OOM / no preemption failures
 - Single-stream decode on this same profile: ~67 tok/s (code)
 
-This is the right profile when most sessions sit far below 1M (typical agent
-turns) but you still want the 1M ceiling available — ~2.7x the single-stream
-throughput across the fleet without giving up context.
+This is the right shape when most sessions sit far below 1M (typical agent
+turns) but you still want the 1M ceiling available. The newer 2026-06-30
+agent-stability checkpoint above is the safer number to cite for Hermes/OpenClaw
+harness validation.
 
 > Higher concurrency is not free: under sustained pressure you can see added
 > scheduler churn, prefill contention, and KV fragmentation. 1M/6 is validated
@@ -293,9 +352,12 @@ usage terms.
 | `.env.dspark.example` | sanitized cluster configuration template |
 | `build-dspark-vllm-runtime.sh` | builds the Stage C image locally and on the worker |
 | `prepare-dspark-model-cache.sh` | downloads/verifies the model cache |
-| `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test; honors `WORKER_DIR` for worker-local paths |
+| `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test; honors worker path/cache/IP overrides |
 | `stop-deepseek-v4-flash-dspark.sh` | stops head and worker services |
 | `patches/keys-concurrency.patch` | path-adjusted Keys Patch 2b update for this repo's already-vendored DSpark concurrency overlay |
+| `AGENT_GARBLE_FIX.md` | update path for older deployments that saw agent garble/drift/loops |
+| `scripts/agent_sanity_bench.py` | direct OpenAI-compatible 1/2/4/6 concurrency and garble check |
+| `scripts/capture_runtime.sh` | captures head/worker Docker inspect, ps, and log tails before/after changes |
 | `benchmarks/keys-concurrency/` | benchmark scripts from Keys' patch repo |
 | `benchmarks/` | measured 1M and concurrency checkpoint evidence |
 
@@ -310,12 +372,23 @@ cp .env.dspark.example .env.dspark
 Edit these values for your cluster:
 
 - `WORKER_HOST`
-- `WORKER_DIR` if the worker checkout/deployment path differs from the head
+- `WORKER_SCRIPT_DIR` if the worker checkout/deployment path differs from the head
 - `MASTER_ADDR`
 - `NCCL_IB_HCA`
 - `NCCL_SOCKET_IFNAME`
 - `NCCL_IB_GID_INDEX`
 - `HF_CACHE`
+- `WORKER_HF_CACHE` if the worker cache path differs from the head
+- `VLLM_HOST_IP` and `WORKER_VLLM_HOST_IP` for each node's fabric IP
+
+Keep these agent-serving defaults unless you are deliberately experimenting:
+
+- `VLLM_HOST=0.0.0.0` if Hermes/OpenClaw or another machine must reach the API
+- `MAX_MODEL_LEN=1048576`
+- `MAX_NUM_SEQS=6`
+- `MTP_NUM_TOKENS=5`
+- `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
+- `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`
 
 Build the base overlay and Stage C NVFP4 image:
 
@@ -338,11 +411,12 @@ Start the service:
 The API serves at:
 
 ```text
-http://127.0.0.1:8888/v1
+http://HEAD_NODE_IP:8888/v1
 ```
 
-By default the service binds to `127.0.0.1`. Set `VLLM_HOST=0.0.0.0` only
-when you intentionally want to expose the API beyond the head node.
+For head-node-only tests, set `VLLM_HOST=127.0.0.1`. For Hermes/OpenClaw or
+another machine to use the endpoint, keep `VLLM_HOST=0.0.0.0` and control
+access at the network/firewall layer.
 
 ## Runtime Profile
 
@@ -424,8 +498,27 @@ docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs vllm-dsp
 Expected 1M/6 checkpoint values are around:
 
 ```text
-GPU KV cache size: 1.6M-1.9M tokens
-Maximum concurrency for 1,048,576 tokens per request: 1.5x-1.8x
+GPU KV cache size: 1.9M-2.0M tokens
+Maximum concurrency for 1,048,576 tokens per request: 1.8x-1.9x
+```
+
+Before pointing an agent harness at the endpoint, run the direct sanity bench:
+
+```bash
+DSPARK_BASE_URL=http://HEAD_NODE_IP:8888/v1 \
+CONCURRENCY=1,2,4,6 \
+python3 scripts/agent_sanity_bench.py
+```
+
+Every row should report `bad_outputs: 0`. If this direct test is clean but an
+agent still garbles, investigate the agent session, fallback list, or harness
+prompt replay before blaming the DSpark weights.
+
+Capture runtime evidence before and after any fix:
+
+```bash
+scripts/capture_runtime.sh runtime-before-change
+scripts/capture_runtime.sh runtime-after-change
 ```
 
 ## Notes

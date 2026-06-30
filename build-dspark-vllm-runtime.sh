@@ -55,5 +55,5 @@ build_one local "$SCRIPT_DIR"
 
 if [ "$WORKER_BUILD" = "1" ]; then
   : "${WORKER_HOST:?WORKER_HOST must be set in $ENV_FILE or environment}"
-  build_one "$WORKER_HOST" "${WORKER_CHECKOUT:-$SCRIPT_DIR}"
+  build_one "$WORKER_HOST" "${WORKER_CHECKOUT:-${WORKER_SCRIPT_DIR:-${WORKER_DIR:-$SCRIPT_DIR}}}"
 fi
