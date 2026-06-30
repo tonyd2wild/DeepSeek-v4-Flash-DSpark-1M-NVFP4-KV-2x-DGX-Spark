@@ -186,6 +186,13 @@ direct vLLM tests can still appear poisoned if the orchestration layer silently
 falls back, reboots a session, or injects a long workspace/tool prompt into the
 visible message stream.
 
+For OpenClaw/Hermes-style supervisor traffic, the validated orchestration fix
+was **bounded bootstrap**: keep enough agent identity/context for normal
+conversation, but cap injected workspace files, startup memory, skill prompts,
+tool result replay, and tool schemas so they do not poison DeepSeek. The
+checkpoint is documented in
+[`benchmarks/20260630-openclaw-bounded-bootstrap-checkpoint.md`](benchmarks/20260630-openclaw-bounded-bootstrap-checkpoint.md).
+
 Validation after the live fix:
 
 ```text
