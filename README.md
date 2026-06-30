@@ -267,7 +267,7 @@ when you intentionally want to expose the API beyond the head node.
 
 ## Runtime Profile
 
-### 1M Single-Stream Profile
+### 1M Keys-Concurrency Profile
 
 Core vLLM flags:
 
@@ -277,15 +277,16 @@ Core vLLM flags:
 - `--kv-cache-dtype nvfp4_ds_mla`
 - `--block-size 256`
 - `--max-model-len 1048576`
-- `--max-num-seqs 1`
+- `--max-num-seqs 6`
 - `--max-num-batched-tokens 8192`
 - `--gpu-memory-utilization 0.80`
-- `--speculative-config '{"method":"dspark","num_speculative_tokens":5}'`
+- `--speculative-config '{"method":"dspark","num_speculative_tokens":${MTP_NUM_TOKENS:-5}}'`
 
 Key runtime env:
 
 - `VLLM_USE_B12X_MOE=1`
-- `VLLM_USE_B12X_WO_PROJECTION=0`
+- `VLLM_USE_B12X_WO_PROJECTION=1`
+- `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
 - `VLLM_DSPARK_CONFIDENCE_SCHEDULER=off`
 - `VLLM_DSPARK_LOCAL_ARGMAX=1`
 - `VLLM_DSPARK_REPLICATE_MARKOV_W1=1`
@@ -313,6 +314,13 @@ python3 benchmarks/keys-concurrency/staggered_bench.py http://127.0.0.1:8888 16 
 python3 benchmarks/keys-concurrency/correctness_test.py http://127.0.0.1:8888
 ```
 
+### 1M Single-Stream Legacy Profile
+
+For conservative single-stream testing, set `MAX_NUM_SEQS=1` and
+`VLLM_USE_B12X_WO_PROJECTION=0`. Keep `MTP_NUM_TOKENS=5` unless you are
+deliberately running an experiment; upstream Mia and Keys both validate the
+DSpark path at MTP5.
+
 ## Verify
 
 After launch:
@@ -334,22 +342,21 @@ docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs vllm-dsp
   | grep -E "GPU KV cache size|Maximum concurrency"
 ```
 
-Expected checkpoint values:
+Expected 1M/6 checkpoint values are around:
 
 ```text
-GPU KV cache size: 2,044,166 tokens
-Maximum concurrency for 1,048,576 tokens per request: 1.95x
+GPU KV cache size: 1.6M-1.9M tokens
+Maximum concurrency for 1,048,576 tokens per request: 1.5x-1.8x
 ```
 
 ## Notes
 
-- The benchmark is single stream, not aggregate throughput.
-- The concurrency benchmark is aggregate throughput and was validated at
+- The old speed checkpoint is single stream, not aggregate throughput.
+- The high-concurrency benchmark is aggregate throughput and was validated at
   `max_model_len=200000`, not full 1M context.
 - Full 1M context and high concurrency compete for the same KV pool. The
-  validated 1M boot reported `2,044,166` total KV tokens and `1.95x` maximum
-  concurrency for 1,048,576-token requests, so treat full-1M serving as a
-  `MAX_NUM_SEQS=1` profile unless you deliberately lower per-request context.
+  1M/6 profile is intended for normal agent traffic where most sessions sit far
+  below the 1M ceiling; it is not six simultaneous full-1M requests.
 - To combine DSpark concurrency with longer context, pick a lower context
   target first, then raise concurrency slowly while watching boot logs, KV
   allocation, acceptance, and request errors.
@@ -359,8 +366,9 @@ Maximum concurrency for 1,048,576 tokens per request: 1.95x
 - The measured probes were p256/p512 with g64/g256. Rebenchmark if you change
   sampling, batching, context length, WO projection, compressed MLA, or the
   confidence scheduler.
-- The validated profile is `MAX_NUM_SEQS=1`, greedy/low-concurrency oriented,
-  `VLLM_USE_B12X_WO_PROJECTION=0`, and `VLLM_DSV4_B12X_COMPRESSED_MLA=0`.
+- The current validated agent-serving profile is `MAX_NUM_SEQS=6`,
+  `MTP_NUM_TOKENS=5`, `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`,
+  `VLLM_USE_B12X_WO_PROJECTION=1`, and `VLLM_DSV4_B12X_COMPRESSED_MLA=0`.
 - Worker-first startup avoids a race during multi-node `mp` initialization.
 - Requires matching images on both nodes, correct NCCL/RoCE settings, and a
   two-node Blackwell-class/DGX Spark setup.
