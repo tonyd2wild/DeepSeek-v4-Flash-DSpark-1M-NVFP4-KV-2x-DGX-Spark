@@ -80,6 +80,31 @@ That means PR `#46995` is relevant to the garble/concurrency fix, but the stock
 official-main image is not yet a safe drop-in replacement for this repo's
 current NVFP4 GB10 runtime.
 
+## Official Main Prototype Patch
+
+After the stock official-main boot failures, a small Python compatibility
+overlay was staged on top of `vllm-dspark-runtime:official-main-dspark-00eb7ce`
+and built as:
+
+- `vllm-dspark-runtime:official-main-dspark-b12x-nvfp4-proto-00eb7ce`
+
+The prototype adds the two missing compatibility bridges found during testing:
+
+- DeepSeek V4 `nvfp4` KV requests resolve to `nvfp4_ds_mla` with the padded MLA
+  cache layout.
+- Official-main MXFP4 MoE can map `flashinfer_b12x` to a B12X MXFP4 expert
+  implementation.
+
+The image passed import/runtime smoke checks for `nvfp4_ds_mla` dtype
+resolution and B12X MXFP4 oracle selection. It has not yet passed full
+DeepSeek V4 Flash model boot, direct generation, or 2/4/6 concurrency. Keep the
+current known-good v0.21/Keys image as the default until those gates pass.
+
+Prototype artifacts:
+
+- [`patches/official-main-b12x-nvfp4-python.patch`](patches/official-main-b12x-nvfp4-python.patch)
+- [`recipe/official-main/Dockerfile.python-patch`](recipe/official-main/Dockerfile.python-patch)
+
 For the concrete port checklist, see
 [`OFFICIAL_MAIN_PORT_PLAN.md`](OFFICIAL_MAIN_PORT_PLAN.md).
 

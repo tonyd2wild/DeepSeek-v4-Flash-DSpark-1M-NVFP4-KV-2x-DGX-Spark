@@ -1,0 +1,48 @@
+FROM vllm-dspark-runtime:official-main-dspark-00eb7ce
+
+COPY vllm/envs.py /opt/env/lib/python3.12/site-packages/vllm/envs.py
+COPY vllm/config/cache.py /opt/env/lib/python3.12/site-packages/vllm/config/cache.py
+COPY vllm/config/vllm.py /opt/env/lib/python3.12/site-packages/vllm/config/vllm.py
+COPY vllm/v1/kv_cache_interface.py /opt/env/lib/python3.12/site-packages/vllm/v1/kv_cache_interface.py
+COPY vllm/models/deepseek_v4/attention.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/attention.py
+COPY vllm/models/deepseek_v4/sparse_mla.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/sparse_mla.py
+COPY vllm/v1/attention/backends/mla/flashmla_sparse.py /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
+COPY vllm/model_executor/layers/fused_moe/oracle/mxfp4.py /opt/env/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+COPY vllm/model_executor/layers/fused_moe/experts/b12x_mxfp4_moe.py /opt/env/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/experts/b12x_mxfp4_moe.py
+
+RUN /opt/env/bin/python - <<'PY'
+from types import SimpleNamespace
+from typing import get_args
+import torch
+
+from vllm.config.cache import CacheDType
+from vllm.models.deepseek_v4.attention import _resolve_dsv4_kv_cache_dtype
+from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLABackend
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+    backend_to_kernel_cls,
+    map_mxfp4_backend,
+)
+from vllm.v1.kv_cache_interface import MLAAttentionSpec, get_kv_quant_mode
+
+assert "nvfp4_ds_mla" in get_args(CacheDType)
+cfg = SimpleNamespace(cache_dtype="nvfp4")
+resolved, dtype = _resolve_dsv4_kv_cache_dtype(True, "nvfp4", cfg)
+assert (resolved, dtype, cfg.cache_dtype) == ("nvfp4_ds_mla", torch.uint8, "nvfp4_ds_mla")
+assert get_kv_quant_mode("nvfp4_ds_mla").is_nvfp4
+spec = MLAAttentionSpec(
+    block_size=256,
+    num_kv_heads=1,
+    head_size=512,
+    dtype=torch.uint8,
+    compress_ratio=2,
+    cache_dtype_str="nvfp4_ds_mla",
+    model_version="deepseek_v4",
+)
+assert spec.real_page_size_bytes > 0
+assert DeepseekV4FlashMLABackend.get_kv_cache_shape(
+    3, 256, 1, 512, "nvfp4_ds_mla"
+) == (3, 256, 584)
+backend = map_mxfp4_backend("flashinfer_b12x")[0]
+assert backend_to_kernel_cls(backend)[0].__name__ == "B12xExperts"
+print("official-main DSpark B12X/NVFP4 python patch ok")
+PY

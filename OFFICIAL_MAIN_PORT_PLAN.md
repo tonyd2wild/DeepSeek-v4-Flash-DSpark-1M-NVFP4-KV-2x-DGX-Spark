@@ -21,6 +21,28 @@ The live production-safe lane remains:
 - `MAX_NUM_SEQS=6`
 - `MTP_NUM_TOKENS=5`
 
+## Prototype Patch Built
+
+A Python-only official-main compatibility overlay was built on 2026-07-01:
+
+- base: `vllm-dspark-runtime:official-main-dspark-00eb7ce`
+- prototype: `vllm-dspark-runtime:official-main-dspark-b12x-nvfp4-proto-00eb7ce`
+
+The overlay passed runtime smoke checks for:
+
+- `nvfp4` -> `nvfp4_ds_mla` DeepSeek V4 KV-cache dtype resolution.
+- `DeepseekV4FlashMLABackend.get_kv_cache_shape(..., "nvfp4_ds_mla")`
+  returning the padded 584-byte layout.
+- MXFP4 oracle mapping of `flashinfer_b12x` to `B12xExperts`.
+
+This is not promoted to the default launcher yet. The remaining gate is a full
+model boot plus direct generation and 2/4/6 concurrency validation.
+
+Files:
+
+- [`patches/official-main-b12x-nvfp4-python.patch`](patches/official-main-b12x-nvfp4-python.patch)
+- [`recipe/official-main/Dockerfile.python-patch`](recipe/official-main/Dockerfile.python-patch)
+
 ## Official Main Boot Failures
 
 Official-main image tested:
@@ -83,4 +105,3 @@ Do not point agents at stock official-main for this repo yet. It contains the
 right DSpark correctness work, but the GB10/SM120 DeepSeek V4 Flash NVFP4
 serving path still needs a compatibility port before it can replace the current
 runtime.
-
