@@ -12,7 +12,7 @@ agent-stability refresh:
 - reported KV pool: about `1.9M-2.0M tokens`
 - reported max concurrency for 1M requests: about `1.8x-1.9x`
 - single-stream decode stayed above `50 tok/s`
-- deterministic direct prompts completed with no Chinese drift or repeated junk
+- direct prompts completed with no Chinese drift or repeated junk
 - 2/4/6 concurrent direct prompts completed cleanly
 - DSpark in-server concurrency patch validated at `max_model_len=200000`,
   `max_num_seqs=16`, with static C16 at `315.1 tok/s` aggregate and
@@ -246,12 +246,14 @@ On this deployment there are three checks to make before blaming the weights:
    the intended overlay commit when in doubt.
 3. **Decode/fallback safety:** for long OpenAI-compatible agent prompts, avoid
    unstable sampling and hidden fallback transitions. The server default should
-   ignore the model card's sampling defaults and use deterministic generation:
+   ignore the model card's sampling defaults and apply a small sampling floor:
 
 ```json
 {
-  "temperature": 0.0,
-  "top_p": 1.0,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "top_k": 40,
+  "repetition_penalty": 1.05,
   "include_reasoning": false,
   "reasoning_effort": "none",
   "chat_template_kwargs": {
@@ -261,11 +263,11 @@ On this deployment there are three checks to make before blaming the weights:
 }
 ```
 
-The compose launcher now includes `--generation-config vllm` plus
-`--override-generation-config '{"temperature":0.0,"top_p":1.0}'` and
+The compose launcher now includes `--generation-config vllm`, builds
+`--override-generation-config` from the `GENERATION_*` env values, and sets
 `thinking=false` so default requests do not inherit unstable model-card sampling.
-Agent harnesses may still add a small repetition penalty during validation if
-they see loops.
+Explicit client request parameters still win. For exact deterministic curl
+checks, send `temperature: 0` in the request body.
 
 Also clear agent fallback lists during validation. A model that looks fixed in
 direct vLLM tests can still appear poisoned if the orchestration layer silently
@@ -354,7 +356,13 @@ usage terms.
 | `prepare-dspark-model-cache.sh` | downloads/verifies the model cache |
 | `start-deepseek-v4-flash-dspark.sh` | worker-first launch and smoke test; honors worker path/cache/IP overrides |
 | `stop-deepseek-v4-flash-dspark.sh` | stops head and worker services |
-| `patches/keys-concurrency.patch` | path-adjusted Keys Patch 2b update for this repo's already-vendored DSpark concurrency overlay |
+| `status-deepseek-v4-flash-dspark.sh` | shows head/worker container state |
+| `logs-deepseek-v4-flash-dspark.sh` | tails head/worker DSpark logs |
+| `smoke-deepseek-v4-flash-dspark.sh` | direct concurrent OpenAI-compatible smoke test |
+| `validate-dspark-config.sh` | renders and checks the local DSpark compose/env config |
+| `patches/keys-concurrency.patch` | full path-adjusted Keys concurrency patch reference |
+| `docs/PATCHES.md` | plain-English Patch 1 / Patch 2 / Patch 2b concurrency explanation |
+| `UPSTREAM_V024_STATUS.md` | current vLLM v0.24.0 vs DSpark PR #46995 upgrade notes |
 | `AGENT_GARBLE_FIX.md` | update path for older deployments that saw agent garble/drift/loops |
 | `scripts/agent_sanity_bench.py` | direct OpenAI-compatible 1/2/4/6 concurrency and garble check |
 | `scripts/capture_runtime.sh` | captures head/worker Docker inspect, ps, and log tails before/after changes |
@@ -387,6 +395,10 @@ Keep these agent-serving defaults unless you are deliberately experimenting:
 - `MAX_MODEL_LEN=1048576`
 - `MAX_NUM_SEQS=6`
 - `MTP_NUM_TOKENS=5`
+- `GENERATION_TEMPERATURE=0.6`
+- `GENERATION_TOP_P=0.95`
+- `GENERATION_TOP_K=40`
+- `GENERATION_REPETITION_PENALTY=1.05`
 - `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
 - `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`
 

@@ -12,7 +12,7 @@ or move production to fp8. The current stable path keeps:
 - `max_num_seqs=6`
 - `MTP_NUM_TOKENS=5`
 - Keys Patch 2b concurrency behavior
-- deterministic server defaults
+- safe server-side sampling defaults for agent gateways
 
 ## What Was Happening
 
@@ -30,13 +30,21 @@ The failures we isolated came from a mix of deployment drift and unsafe defaults
 4. Harness testing can be contaminated by stale sessions or silent fallbacks.
 5. Some worker nodes need their own checkout path and Hugging Face cache path.
 
+The sampling override is a server-side floor for requests that omit sampling
+fields. If a client sends explicit `temperature`, `top_p`, `top_k`, or
+`repetition_penalty`, the client request remains the source of truth.
+
 ## What Changed
 
 The public recipe now carries the stable agent-serving defaults directly:
 
 - `--default-chat-template-kwargs '{"thinking":false}'`
 - `--generation-config vllm`
-- `--override-generation-config '{"temperature":0.0,"top_p":1.0}'`
+- `--override-generation-config` built from:
+  - `GENERATION_TEMPERATURE=0.6`
+  - `GENERATION_TOP_P=0.95`
+  - `GENERATION_TOP_K=40`
+  - `GENERATION_REPETITION_PENALTY=1.05`
 - `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
 - `VLLM_DSPARK_CONFIDENCE_SCHEDULER=off`
 - `VLLM_DSPARK_LOCAL_ARGMAX=1`
@@ -76,6 +84,10 @@ MAX_NUM_SEQS=6
 MAX_NUM_BATCHED_TOKENS=8192
 GPU_MEMORY_UTILIZATION=0.80
 MTP_NUM_TOKENS=5
+GENERATION_TEMPERATURE=0.6
+GENERATION_TOP_P=0.95
+GENERATION_TOP_K=40
+GENERATION_REPETITION_PENALTY=1.05
 ```
 
 Then replace the old env file:
@@ -154,8 +166,10 @@ Only after direct vLLM prompts are clean, point Hermes/OpenClaw/other agents to:
 http://HEAD_NODE_IP:8888/v1
 model: deepseek-v4-flash-dspark
 context_length: 1048576
-temperature: 0
-top_p: 1.0
+temperature: 0.6
+top_p: 0.95
+top_k: 40
+repetition_penalty: 1.05
 thinking: false
 ```
 
@@ -164,8 +178,7 @@ During validation:
 - disable hidden fallbacks to Qwen/27B/other models
 - clear or restart stale sessions if a session already garbled
 - test one direct prompt, then 2/4/6 concurrent prompts, then agent traffic
-- keep sampling deterministic while debugging
+- use explicit `temperature: 0` only for exact deterministic curl checks
 
 If direct vLLM is clean but agent traffic still garbles, the remaining problem
 is probably harness/session/fallback state, not the DSpark weights.
-
