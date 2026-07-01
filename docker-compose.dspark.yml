@@ -93,7 +93,7 @@ services:
         exec /opt/env/bin/vllm serve ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}
         --served-model-name ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}
         --host ${VLLM_HOST:-127.0.0.1}
-        --port 8888
+        --port ${VLLM_PORT:-8888}
         --trust-remote-code
         --tensor-parallel-size 2
         --pipeline-parallel-size 1
@@ -104,7 +104,7 @@ services:
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.80}
         --enable-prefix-caching
-        --speculative-config "$${SPECULATIVE_CONFIG}"
+        --speculative-config '{"method":"dspark","num_speculative_tokens":${MTP_NUM_TOKENS}}'
         --tokenizer-mode deepseek_v4
         --distributed-executor-backend mp
         --tool-call-parser deepseek_v4
