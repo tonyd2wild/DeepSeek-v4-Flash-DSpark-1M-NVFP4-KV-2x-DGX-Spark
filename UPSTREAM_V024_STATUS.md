@@ -80,6 +80,9 @@ That means PR `#46995` is relevant to the garble/concurrency fix, but the stock
 official-main image is not yet a safe drop-in replacement for this repo's
 current NVFP4 GB10 runtime.
 
+For the concrete port checklist, see
+[`OFFICIAL_MAIN_PORT_PLAN.md`](OFFICIAL_MAIN_PORT_PLAN.md).
+
 ## Current Repo Default
 
 Until the v0.24 DSpark lane is proven, this repo's production default remains:
