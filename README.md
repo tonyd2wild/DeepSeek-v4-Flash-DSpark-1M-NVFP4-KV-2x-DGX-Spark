@@ -1,34 +1,82 @@
-# DeepSeek V4 Flash DSpark 1M NVFP4 KV on 2x DGX Spark
+# DeepSeek V4 Flash DSpark C12 NVFP4 KV on 2x DGX Spark
 
 Self-contained two-node DGX Spark recipe for serving `DeepSeek-V4-Flash-DSpark`
-with vLLM TP=2, DSpark speculative decoding, and a 1M-token max model length
+with vLLM TP=2, DSpark speculative decoding, and a 1.5M-token max model length
 using the experimental `nvfp4_ds_mla` KV-cache path.
 
-This repo captures the validated 1M NVFP4 checkpoint and the 2026-06-30
-agent-stability refresh:
+This repo captures the validated Stage C NVFP4 runtime, the 2026-06-30
+agent-stability refresh, and the 2026-07-02 Keys C12 checkpoint:
 
-- `max_model_len=1048576`
+- `max_model_len=1500000`
+- `max_num_seqs=12`
 - `kv_cache_dtype=nvfp4_ds_mla`
-- reported KV pool: about `1.9M-2.0M tokens`
-- reported max concurrency for 1M requests: about `1.8x-1.9x`
+- reported KV pool: `3,225,280 tokens`
+- reported max concurrency for 1.5M requests: `2.15x`
 - single-stream decode stayed above `50 tok/s`
-- direct prompts completed with no Chinese drift or repeated junk
-- 2/4/6 concurrent direct prompts completed cleanly
+- deterministic direct prompts completed with no Chinese drift or repeated junk
+- 2/4/6/12 concurrent code-gate prompts completed cleanly
 - DSpark in-server concurrency patch validated at `max_model_len=200000`,
   `max_num_seqs=16`, with static C16 at `315.1 tok/s` aggregate and
   staggered C16 at `205.0 tok/s` aggregate
 
 If you already deployed an older copy and saw agent garble, loops, Chinese
 drift, or prompt/tool XML leaking into replies, start with
-[`AGENT_GARBLE_FIX.md`](AGENT_GARBLE_FIX.md). The fix path keeps the 1M NVFP4
+[`AGENT_GARBLE_FIX.md`](AGENT_GARBLE_FIX.md). The fix path keeps the C12 NVFP4
 profile; it does not switch production to fp8 or a smaller fallback model.
 
 ## Result
 
+### 2026-07-02 Keys C12 1.5M NVFP4 Checkpoint
+
+The current high-concurrency lane keeps Tony's known-good Stage C NVFP4 image
+and applies Keys' C12 serving profile.
+
+Runtime:
+
+- endpoint tested: `http://100.90.25.78:8888/v1`
+- served model: `deepseek-v4-flash-dspark`
+- image: `vllm-dspark-runtime:dspark-nvfp4-stage-c`
+- model path: `/cache/huggingface/fraserprice/DeepSeek-V4-Flash-DSpark`
+- `kv_cache_dtype=nvfp4_ds_mla`
+- `max_model_len=1500000`
+- `max_num_seqs=12`
+- `max_num_batched_tokens=8192`
+- `gpu_memory_utilization=0.85`
+- `MTP_NUM_TOKENS=5`
+- `VLLM_USE_B12X_WO_PROJECTION=1`
+- `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
+- `thinking=false`
+- `--generation-config vllm`
+- `--override-generation-config '{"temperature":0.0,"top_p":1.0,"top_k":40,"repetition_penalty":1.05}'`
+
+Boot evidence:
+
+```text
+GPU KV cache size: 3,225,280 tokens
+Maximum concurrency for 1,500,000 tokens per request: 2.15x
+Application startup complete.
+```
+
+Code-gate validation:
+
+| concurrency | success | server generation tok/s | acceptance | bad outputs |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1/1 | 52.79 | 0.585 | 0 |
+| 2 | 2/2 | 79.76 | 0.600 | 0 |
+| 4 | 4/4 | 134.70 | 0.602 | 0 |
+| 6 | 6/6 | 127.78 | 0.615 | 0 |
+| 12 | 12/12 | 230.10 | 0.602 | 0 |
+
+The checkpoint note is in
+[`benchmarks/20260702-keys-c12-1p5m-nvfp4-checkpoint.md`](benchmarks/20260702-keys-c12-1p5m-nvfp4-checkpoint.md).
+
+Do not enable `VLLM_USE_B12X_FP8_GEMM=1` on this Stage C image. That flag hit a
+DeepGEMM layout assertion during DSpark drafter warmup in testing.
+
 ### 2026-06-30 Clean Agent-Serving Checkpoint
 
-The latest clean endpoint was reproduced on Asusi/Spark4 before sending the
-model back through Hermes/OpenClaw-style harnesses.
+The prior conservative clean endpoint was reproduced on Asusi/Spark4 before
+sending the model back through Hermes/OpenClaw-style harnesses.
 
 Runtime:
 
@@ -392,14 +440,20 @@ Edit these values for your cluster:
 Keep these agent-serving defaults unless you are deliberately experimenting:
 
 - `VLLM_HOST=0.0.0.0` if Hermes/OpenClaw or another machine must reach the API
-- `MAX_MODEL_LEN=1048576`
-- `MAX_NUM_SEQS=6`
+- `MAX_MODEL_LEN=1500000`
+- `MAX_NUM_SEQS=12`
+- `GPU_MEMORY_UTILIZATION=0.85`
 - `MTP_NUM_TOKENS=5`
 - `GENERATION_TEMPERATURE=0.6`
 - `GENERATION_TOP_P=0.95`
 - `GENERATION_TOP_K=40`
 - `GENERATION_REPETITION_PENALTY=1.05`
 - `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
+- `VLLM_USE_B12X_WO_PROJECTION=1`
+- `GENERATION_TEMPERATURE=0.0`
+- `GENERATION_TOP_P=1.0`
+- `GENERATION_TOP_K=40`
+- `GENERATION_REPETITION_PENALTY=1.05`
 - `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`
 
 Build the base overlay and Stage C NVFP4 image:
@@ -497,7 +551,7 @@ curl -fsS http://127.0.0.1:8888/v1/models
 Confirm the returned model entry reports:
 
 ```json
-"max_model_len": 1048576
+"max_model_len": 1500000
 ```
 
 Then check logs:
@@ -507,11 +561,11 @@ docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs vllm-dsp
   | grep -E "GPU KV cache size|Maximum concurrency"
 ```
 
-Expected 1M/6 checkpoint values are around:
+Expected C12 checkpoint values are around:
 
 ```text
-GPU KV cache size: 1.9M-2.0M tokens
-Maximum concurrency for 1,048,576 tokens per request: 1.8x-1.9x
+GPU KV cache size: 3.2M tokens
+Maximum concurrency for 1,500,000 tokens per request: 2.1x
 ```
 
 Before pointing an agent harness at the endpoint, run the direct sanity bench:
@@ -538,9 +592,9 @@ scripts/capture_runtime.sh runtime-after-change
 - The old speed checkpoint is single stream, not aggregate throughput.
 - The high-concurrency benchmark is aggregate throughput and was validated at
   `max_model_len=200000`, not full 1M context.
-- Full 1M context and high concurrency compete for the same KV pool. The
-  1M/6 profile is intended for normal agent traffic where most sessions sit far
-  below the 1M ceiling; it is not six simultaneous full-1M requests.
+- Full context and high concurrency compete for the same KV pool. The C12
+  1.5M profile is intended for normal agent traffic where most sessions sit far
+  below the 1.5M ceiling; it is not twelve simultaneous full-1.5M requests.
 - To combine DSpark concurrency with longer context, pick a lower context
   target first, then raise concurrency slowly while watching boot logs, KV
   allocation, acceptance, and request errors.
@@ -550,9 +604,11 @@ scripts/capture_runtime.sh runtime-after-change
 - The measured probes were p256/p512 with g64/g256. Rebenchmark if you change
   sampling, batching, context length, WO projection, compressed MLA, or the
   confidence scheduler.
-- The current validated agent-serving profile is `MAX_NUM_SEQS=6`,
+- The current validated agent-serving profile is `MAX_MODEL_LEN=1500000`,
+  `MAX_NUM_SEQS=12`, `GPU_MEMORY_UTILIZATION=0.85`,
   `MTP_NUM_TOKENS=5`, `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`,
-  `VLLM_USE_B12X_WO_PROJECTION=1`, and `VLLM_DSV4_B12X_COMPRESSED_MLA=0`.
+  `VLLM_USE_B12X_WO_PROJECTION=1`, deterministic generation overrides, and
+  `VLLM_DSV4_B12X_COMPRESSED_MLA=0`.
 - Worker-first startup avoids a race during multi-node `mp` initialization.
 - Requires matching images on both nodes, correct NCCL/RoCE settings, and a
   two-node Blackwell-class/DGX Spark setup.

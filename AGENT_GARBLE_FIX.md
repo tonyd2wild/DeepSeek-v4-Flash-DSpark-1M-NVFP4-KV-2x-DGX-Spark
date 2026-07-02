@@ -1,4 +1,4 @@
-# Agent Garble Fix - Fresh 1M NVFP4 DSpark Profile
+# Agent Garble Fix - Fresh C12 NVFP4 DSpark Profile
 
 This note is for anyone who already cloned or deployed this repo and then saw
 agent traffic degrade into repeated characters, Chinese drift, leaked tool/XML
@@ -8,8 +8,8 @@ The fix is not to drop DeepSeek V4 Flash DSpark, switch to a smaller fallback,
 or move production to fp8. The current stable path keeps:
 
 - `kv_cache_dtype=nvfp4_ds_mla`
-- `max_model_len=1048576`
-- `max_num_seqs=6`
+- `max_model_len=1500000`
+- `max_num_seqs=12`
 - `MTP_NUM_TOKENS=5`
 - Keys Patch 2b concurrency behavior
 - safe server-side sampling defaults for agent gateways
@@ -40,11 +40,7 @@ The public recipe now carries the stable agent-serving defaults directly:
 
 - `--default-chat-template-kwargs '{"thinking":false}'`
 - `--generation-config vllm`
-- `--override-generation-config` built from:
-  - `GENERATION_TEMPERATURE=0.6`
-  - `GENERATION_TOP_P=0.95`
-  - `GENERATION_TOP_K=40`
-  - `GENERATION_REPETITION_PENALTY=1.05`
+- `--override-generation-config '{"temperature":0.0,"top_p":1.0,"top_k":40,"repetition_penalty":1.05}'`
 - `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
 - `VLLM_DSPARK_CONFIDENCE_SCHEDULER=off`
 - `VLLM_DSPARK_LOCAL_ARGMAX=1`
@@ -79,13 +75,13 @@ WORKER_HF_CACHE=...
 VLLM_HOST=0.0.0.0
 VLLM_HOST_IP=...
 WORKER_VLLM_HOST_IP=...
-MAX_MODEL_LEN=1048576
-MAX_NUM_SEQS=6
+MAX_MODEL_LEN=1500000
+MAX_NUM_SEQS=12
 MAX_NUM_BATCHED_TOKENS=8192
-GPU_MEMORY_UTILIZATION=0.80
+GPU_MEMORY_UTILIZATION=0.85
 MTP_NUM_TOKENS=5
-GENERATION_TEMPERATURE=0.6
-GENERATION_TOP_P=0.95
+GENERATION_TEMPERATURE=0.0
+GENERATION_TOP_P=1.0
 GENERATION_TOP_K=40
 GENERATION_REPETITION_PENALTY=1.05
 ```
@@ -121,7 +117,7 @@ curl -fsS http://HEAD_NODE_IP:8888/v1/models
 Confirm the model reports:
 
 ```json
-"max_model_len": 1048576
+"max_model_len": 1500000
 ```
 
 Then run a deterministic chat check:
@@ -153,10 +149,21 @@ docker compose --env-file .env.dspark -f docker-compose.dspark.yml logs vllm-dsp
 Expected shape:
 
 ```text
-GPU KV cache size: about 1.9M to 2.0M tokens
-Maximum concurrency for 1,048,576 tokens per request: about 1.8x to 1.9x
+GPU KV cache size: about 3.2M tokens
+Maximum concurrency for 1,500,000 tokens per request: about 2.1x
 Application startup complete.
 ```
+
+If you need the prior conservative agent lane, use:
+
+```bash
+MAX_MODEL_LEN=1048576
+MAX_NUM_SEQS=6
+GPU_MEMORY_UTILIZATION=0.80
+```
+
+Do not enable `VLLM_USE_B12X_FP8_GEMM=1` on the Stage C image. It selected an
+experimental dense FP8 path but failed DSpark drafter warmup during validation.
 
 ## Agent Harness Rules
 
@@ -165,13 +172,15 @@ Only after direct vLLM prompts are clean, point Hermes/OpenClaw/other agents to:
 ```text
 http://HEAD_NODE_IP:8888/v1
 model: deepseek-v4-flash-dspark
-context_length: 1048576
-temperature: 0.6
-top_p: 0.95
+context_length: 1500000
+temperature: 0
+top_p: 1.0
 top_k: 40
 repetition_penalty: 1.05
 thinking: false
 ```
+
+For the prior conservative 1M/6 lane, use `context_length: 1048576`.
 
 During validation:
 
